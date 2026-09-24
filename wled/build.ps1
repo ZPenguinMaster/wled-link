@@ -18,11 +18,14 @@ function Invoke-Checked([scriptblock]$cmd) {
 }
 
 if (-not (Test-Path $src)) {
-    Invoke-Checked { git clone --depth 1 --branch $tag https://github.com/wled/WLED.git $src }
+    Invoke-Checked { git clone -c core.autocrlf=false --depth 1 --branch $tag https://github.com/wled/WLED.git $src }
 }
 Push-Location $src
 try {
-    Invoke-Checked { git checkout -- . }
+    # a clean checkout with WLED's own LF line endings, which the patch expects
+    Invoke-Checked { git config core.autocrlf false }
+    Invoke-Checked { git rm -r -q --cached . }
+    Invoke-Checked { git reset -q --hard }
     Invoke-Checked { git apply (Join-Path $PSScriptRoot 'wledlink.patch') }
     # WLED builds with its own toolchain (a Tasmota build of the Arduino core); keep it apart from the bridge's.
     $env:PLATFORMIO_CORE_DIR = Join-Path $src '.platformio'

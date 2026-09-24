@@ -1,0 +1,2 @@
+# the WLED patch must match WLED's own LF line endings to apply
+*.patch text eol=lf
