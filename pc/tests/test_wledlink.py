@@ -26,6 +26,7 @@ from fake_bridge import FakeBridge  # noqa: E402
 from fake_wled import BIG, HTML, FakeWled  # noqa: E402
 
 LISTEN = "127.0.0.9"
+CRLF = chr(13) + chr(10)
 HTTP_PORT = 18080
 BASE = f"http://{LISTEN}:{HTTP_PORT}"
 results = []
@@ -50,6 +51,22 @@ def unit_tests():
     damaged = bytearray(frame[:-1])
     damaged[4] ^= 0x10
     check("damaged frame rejected", wl.decode_frame(bytes(damaged)) is None)
+
+    class VanishingPort:  # what the bridge's port does while the PC wakes up and USB re-enumerates
+        in_waiting = 0
+        def read(self, n):
+            raise wl.serial.SerialException("ClearCommError failed (PermissionError(13, 'Access is denied.'))")
+        def close(self):
+            raise OSError("already gone")
+    real_open = wl.open_serial
+    wl.open_serial = lambda name, baud: VanishingPort()
+    try:
+        survived = wl.PortScanner().scan("COM99", wl.DEFAULT_BAUD, None) is None
+    except Exception:
+        survived = False
+    finally:
+        wl.open_serial = real_open
+    check("a port that fails mid-probe doesn't stop the search for the bridge", survived)
 
 
 def http(method, path, body=None, headers=None, timeout=15):
@@ -155,6 +172,8 @@ async def e2e():
         await asyncio.sleep(0.5)
         got = [d for _, d in wled.udp_packets]
         check("DNRGB colour packets arrive at WLED", len(got) >= 28 and all(g in sent for g in got), f"{len(got)}/30")
+        s = await status()
+        check("the stream shows up as live at once", s["light"].get("live") == 1, s["light"])
 
         print("web UI traffic")
         code, headers, body = await ahttp("GET", "/", headers={"Accept": "text/html"})
@@ -179,43 +198,76 @@ async def e2e():
               f"daemon {s['openConnections']}, wled {wled.active}")
         check("PC clock was sent to WLED", any("time" in p for p in wled.posts))
 
-        print("status page and quick actions")
+        print("pages")
         code, _, body = await ahttp("GET", "/__wledlink")
-        check("status page served", code == 200 and b"Neutral white 100%" in body)
+        check("control page served", code == 200 and b"PC Sync" in body and b"EventSource" in body)
+        code, _, body = await ahttp("GET", "/__wledlink/phone")
+        check("phone page served", code == 200 and b"Connect to your light" in body)
         s = await status()
         settings = (s["wled"] or {}).get("settings") or {}
         check("WLED settings read for the status page", settings.get("readable") and settings.get("apBehavior") == 0, settings)
+        check("serial link sped up to 2 Mbaud", s.get("baud") == 2_000_000 and bridge.baud_requests == [2_000_000],
+              (s.get("baud"), bridge.baud_requests))
+        code, _, body = await ahttp("GET", "/__wledlink/presets")
+        check("WLED presets listed", code == 200 and [p["name"] for p in json.loads(body)] == ["Chill", "Party"], body[:200])
+
+        print("instant path")
+        events = await Events.open()
+        first = await events.next()
+        check("live updates stream the status right away", first and "light" in first and first["light"].get("ws") == 1)
+        check("a stopped stream stops counting as live",
+              ((first or {}).get("light") or {}).get("live") == 0
+              or await events.until(lambda st: st["light"].get("live") == 0, 4) is not None)
+        t0 = time.monotonic()
+        code, _, _ = await ahttp("POST", "/__wledlink/api/state", json.dumps({"on": False}).encode())
+        update = await events.until(lambda st: st["light"].get("on") == 0, 2)
+        latency = (time.monotonic() - t0) * 1000
+        check("a command goes straight to the bridge (no HTTP round trip to WLED)",
+              code == 200 and bridge.wled_cmds and bridge.wled_cmds[-1] == {"on": False})
+        check("the new state is pushed to open pages at once", update is not None, f"{latency:.0f} ms")
+        print(f"         (click -> page updated in {latency:.0f} ms through the simulated link)")
+        check("WLED receives the forwarded command", await until(lambda: wled.state.get("on") is False, 3))
+        events.close()
 
         print("white buttons")
         led, gamma = wled.cfg["hw"]["led"], wled.cfg["light"]["gc"]
         led["rgbwm"] = 3  # a global auto-white override (Dual) that a careless partial update would wipe
         reply = await white("neutral")
-        seg = wled.posts[-1].get("seg", {})
-        check("neutral: both white channels at full (CCT 127, white only, 100%)",
+        cmd = await last_cmd(bridge)
+        seg = cmd.get("seg", {})
+        check("neutral: both white channels at full (CCT 127, white only, 100%, no fade)",
               reply.get("ok") and seg.get("cct") == 127 and seg["col"][0] == [0, 0, 0, 255]
-              and wled.posts[-1].get("bri") == 255 and wled.posts[-1].get("lor") == 2, (reply, wled.posts[-1]))
+              and cmd.get("bri") == 255 and cmd.get("lor") == 2 and cmd.get("tt") == 0, (reply, cmd))
         check("neutral: turned on 100% CCT additive blending", led["cb"] == 100 and any("blending" in n for n in reply["notes"]), led)
         check("settings change left gamma, auto-white and frame rate alone",
               gamma["col"] == 2.8 and gamma["bri"] == 1 and led["rgbwm"] == 3 and led["fps"] == 42, (gamma, led))
         check("settings change did not restart the LED outputs", wled.bus_reinits == 0)
         posts = len(wled.cfg_posts)
-        reply = await white("cool")
-        check("cool: cool white only (CCT 255)", reply.get("ok") and wled.posts[-1]["seg"]["cct"] == 255
-              and len(wled.cfg_posts) == posts, (reply, wled.posts[-1]))
+        reply = await white("cool", fresh=False)
+        cmd = await last_cmd(bridge)
+        check("cool: cool white only (CCT 255), from cached settings", reply.get("ok") and cmd["seg"]["cct"] == 255
+              and len(wled.cfg_posts) == posts, (reply, cmd))
         rc = await cli("white", "warm", "--brightness", "50")
-        check("'wledlink.py white warm' command", rc.returncode == 0 and wled.posts[-1]["seg"]["cct"] == 0
-              and abs(wled.posts[-1]["bri"] - 128) <= 1, rc.stdout + rc.stderr)
+        cmd = await last_cmd(bridge)
+        check("'wledlink.py white warm' command", rc.returncode == 0 and cmd["seg"]["cct"] == 0
+              and abs(cmd["bri"] - 128) <= 1, rc.stdout + rc.stderr)
         led["rgbwm"] = 2  # Accurate: white has to be asked for as full RGB
         await white("neutral")
-        check("adapts to 'Accurate' auto-white (RGB white -> white LEDs)", wled.posts[-1]["seg"]["col"][0] == [255, 255, 255, 0])
+        check("adapts to 'Accurate' auto-white (RGB white -> white LEDs)", (await last_cmd(bridge))["seg"]["col"][0] == [255, 255, 255, 0])
         led["rgbwm"] = 1
         reply = await white("neutral")
+        await last_cmd(bridge)
         check("explains 'Brighter' auto-white mixes RGB in", any("Brighter" in n for n in reply["notes"]))
         led["rgbwm"], led["cb"], wled.cfg_locked = 3, 0, True
         reply = await white("neutral")
         check("PIN-locked settings: still switches to white and says how to finish",
-              reply.get("ok") and wled.posts[-1]["seg"]["cct"] == 127 and any("100%" in n for n in reply["notes"]), reply)
+              reply.get("ok") and (await last_cmd(bridge))["seg"]["cct"] == 127 and any("100%" in n for n in reply["notes"]), reply)
         wled.cfg_locked = False
+        code, _, body = await ahttp("POST", "/__wledlink/api/wled-transition", json.dumps({"instant": True}).encode())
+        tr, sent = wled.cfg["light"]["tr"], wled.cfg_posts[-1]["light"]["tr"]
+        check("instant changes: WLED's default fade set to 0, the rest of its settings kept",
+              code == 200 and tr.get("dur") == 0 and sent == {"mode": True, "dur": 0, "pal": 0, "rpc": 5}
+              and gamma["col"] == 2.8, (sent, body[:200]))
         rc = await cli("wled-hotspot", "fallback")
         check("'wled-hotspot fallback' makes WLED open its hotspot whenever it loses the bridge",
               rc.returncode == 0 and wled.cfg["ap"]["behav"] == 1 and gamma["col"] == 2.8 and led["rgbwm"] == 3, rc.stdout + rc.stderr)
@@ -225,7 +277,11 @@ async def e2e():
         check("status reports the hotspot mode", s["wled"]["settings"].get("apBehavior") == 3)
         check("status reports the bridge Wi-Fi mode", s["bridge"].get("wifiWithPc") is False, s["bridge"])
         rc = await cli("signalrgb")
-        check("'wledlink.py signalrgb' command hands control back", rc.returncode == 0 and wled.state.get("lor") == 0, rc.stdout + rc.stderr)
+        check("'wledlink.py signalrgb' command hands control back", rc.returncode == 0 and (await last_cmd(bridge)).get("lor") == 0
+              and await until(lambda: wled.state.get("lor") == 0, 3), rc.stdout + rc.stderr)
+        cmd = await last_cmd(bridge)
+        check("handing back restarts WLED's live session and blanks its own colour (no leftover LEDs)",
+              cmd.get("live") is False and cmd["seg"]["col"][0] == [0, 0, 0, 0] and cmd["seg"]["fx"] == 0, cmd)
         rc = await cli("status")
         check("'wledlink.py status' command", rc.returncode == 0 and "Test WLED" in rc.stdout, rc.stdout + rc.stderr)
 
@@ -280,7 +336,25 @@ async def e2e():
         check("bridge-config reaches the bridge", code == 200 and json.loads(body).get("ok") and bridge.config_payloads[-1] == payload)
         check("still works after the config reboot", await wait_for(json_info_ok, 10, "recovery after config"))
 
+        print("WLED firmware update")
+        wled.state.update(on=True, bri=200, lor=2)
+        firmware = os.path.join(HERE, "_fw_test.bin")
+        with open(firmware, "wb") as f:
+            f.write(bytes([0xE9]) + os.urandom(150_000))
+        try:
+            rc = await cli("wled-update", firmware)
+        finally:
+            os.remove(firmware)
+        check("'wled-update' uploads the firmware through the link, intact",
+              rc.returncode == 0 and wled.firmware_uploads == [150_001], (wled.firmware_uploads, rc.stdout + rc.stderr))
+        check("after the restart the light gets its look back",
+              wled.state.get("bri") == 200 and wled.state.get("lor") == 2, wled.state)
+
         print("stopping")
+        rc = await cli("run", "--port", "socket://127.0.0.1:1")
+        check("a second copy exits at once and leaves the running one alone (autostart watchdog)",
+              rc.returncode == 0 and "already running" in rc.stdout and (await status())["bridge"]["state"] == "ready",
+              rc.stdout + rc.stderr)
         rc = await cli("stop")
         exited = await asyncio.to_thread(lambda: daemon.wait(10) is not None)
         check("'wledlink.py stop' ends the running link", rc.returncode == 0 and exited, rc.stdout + rc.stderr)
@@ -296,9 +370,63 @@ async def e2e():
             print(open(log_path).read()[-6000:])
 
 
-async def white(tone):
-    _, _, body = await ahttp("POST", "/__wledlink/api/white", json.dumps({"tone": tone, "brightness": 100}).encode())
-    return json.loads(body)
+async def white(tone, fresh=True):
+    body = json.dumps({"tone": tone, "brightness": 100, "fresh": fresh}).encode()
+    _, _, reply = await ahttp("POST", "/__wledlink/api/white", body)
+    return json.loads(reply)
+
+
+async def until(pred, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        await asyncio.sleep(0.02)
+    return False
+
+
+_seen_cmds = [0]
+
+
+async def last_cmd(bridge):
+    """The newest command the bridge received since the previous call (waits for it to arrive)."""
+    await until(lambda: len(bridge.wled_cmds) > _seen_cmds[0], 3)
+    _seen_cmds[0] = len(bridge.wled_cmds)
+    return bridge.wled_cmds[-1] if bridge.wled_cmds else {}
+
+
+class Events:
+    """Reads the control page's server-sent events."""
+
+    @classmethod
+    async def open(cls):
+        self = cls()
+        self.reader, self.writer = await asyncio.open_connection(LISTEN, HTTP_PORT)
+        self.writer.write(f"GET /__wledlink/events HTTP/1.1{CRLF}Host: {LISTEN}:{HTTP_PORT}{CRLF}{CRLF}".encode())
+        await self.reader.readuntil((CRLF + CRLF).encode())
+        return self
+
+    async def next(self, timeout=3):
+        try:
+            while True:
+                line = await asyncio.wait_for(self.reader.readline(), timeout)
+                if not line:
+                    return None
+                if line.startswith(b"data: "):
+                    return json.loads(line[6:])
+        except (asyncio.TimeoutError, ValueError):
+            return None
+
+    async def until(self, pred, timeout):
+        deadline = time.monotonic() + timeout
+        while (left := deadline - time.monotonic()) > 0:
+            st = await self.next(left)
+            if st and pred(st):
+                return st
+        return None
+
+    def close(self):
+        self.writer.close()
 
 
 async def cli(*args):

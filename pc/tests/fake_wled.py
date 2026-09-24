@@ -31,6 +31,8 @@ class FakeWled:
         self.cfg_locked = False  # behaves like a settings PIN is set
         self.cfg_posts = []
         self.bus_reinits = 0
+        self.uptime = 5000
+        self.firmware_uploads = []  # sizes of the files posted to /update
 
     def apply_cfg(self, doc):
         """Like WLED 0.15's deserializeConfig for these keys, including what it resets when a key is missing."""
@@ -46,6 +48,8 @@ class FakeWled:
         gc = (doc.get("light") or {}).get("gc") or {}
         self.cfg["light"]["gc"]["bri"] = gc.get("bri", 0)   # gamma correction: switched off if missing
         self.cfg["light"]["gc"]["col"] = gc.get("col", 0)
+        for key, value in ((doc.get("light") or {}).get("tr") or {}).items():  # fade settings: kept if missing
+            self.cfg["light"]["tr"][key] = value
         ap = doc.get("ap") or {}
         for key in ("chan", "hide", "behav"):
             if key in ap:
@@ -54,7 +58,7 @@ class FakeWled:
     def info(self):
         return {"ver": "0.15.0", "leds": {"count": 80, "rgbw": True, "cct": 1, "lc": 7}, "name": "Test WLED",
                 "udpport": 21324, "live": False, "brand": "WLED", "product": "FOSS", "mac": "aabbccddeeff",
-                "ip": self.reported_ip, "wifi": {"bssid": "00:00:00:00:00:00", "rssi": -40, "signal": 100, "channel": 6}}
+                "ip": self.reported_ip, "uptime": self.uptime, "release": "ESP32", "wifi": {"bssid": "00:00:00:00:00:00", "rssi": -40, "signal": 100, "channel": 6}}
 
     async def start(self):
         self.server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
@@ -98,6 +102,8 @@ class FakeWled:
             data = json.dumps({"state": self.state, "info": self.info()}).encode()
             chunks = b"".join(b"%x\r\n%s\r\n" % (len(data[i:i + 100]), data[i:i + 100]) for i in range(0, len(data), 100))
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n" + chunks + b"0\r\n\r\n")
+        elif path == "/presets.json":
+            send("200 OK", json.dumps({"0": {}, "1": {"n": "Chill", "on": True}, "2": {"n": "Party", "playlist": {"ps": [1]}}}).encode())
         elif path in ("/json/cfg", "/json/cfg/"):
             if self.cfg_locked:
                 send("401 Unauthorized", b'{"error":1}')
@@ -107,6 +113,16 @@ class FakeWled:
                 send("200 OK", b'{"success":true}')
             else:
                 send("200 OK", json.dumps(self.cfg).encode())
+        elif path == "/update" and method == "POST":
+            # a multipart upload: keep the file part, answer like WLED, then "restart"
+            boundary = headers["content-type"].split("boundary=")[1].encode()
+            part = body.split(b"--" + boundary)[1]
+            self.firmware_uploads.append(len(part.split(bytes([13, 10, 13, 10]), 1)[1]) - 2)
+            send("200 OK", b"<html><body><h2>Update successful!</h2>Rebooting...</body></html>", "text/html")
+            self.uptime = 2
+            self.state.update(on=True, bri=128, lor=0)  # WLED's power-on look
+        elif path in ("/json/state", "/json/state/") and method == "GET":
+            send("200 OK", json.dumps(self.state).encode())
         elif path in ("/json/state", "/json/state/") and method == "POST":
             posted = json.loads(body)
             self.posts.append(posted)

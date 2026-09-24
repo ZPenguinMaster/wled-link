@@ -2,125 +2,349 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="color-scheme" content="dark light">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="theme-color" content="#111111">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0a0a0c">
 <title>Lights</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23111'/%3E%3Crect x='12' y='27' width='40' height='10' rx='5' fill='%23ffb45a'/%3E%3C/svg%3E">
 <style>
-  :root { --bg:#111; --card:#1d1d1d; --fg:#eee; --dim:#999; --line:#2e2e2e; --acc:#4a8cff; --ok:#4caf50; --bad:#e5484d; }
-  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-  body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.4 -apple-system, "Segoe UI", system-ui, sans-serif; }
-  main { max-width: 480px; margin: 0 auto; padding: max(16px, env(safe-area-inset-top)) 16px 32px; }
-  h1 { font-size: 22px; margin: 4px 0 2px; }
-  #status { color: var(--dim); margin: 0 0 16px; min-height: 1.4em; }
-  #status.ok { color: var(--ok); } #status.bad { color: var(--bad); }
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-  button { font: inherit; font-weight: 600; min-height: 64px; border-radius: 14px; border: 1px solid var(--line);
-           background: var(--card); color: var(--fg); padding: 10px; }
-  button:disabled { opacity: .35; }
-  button.wide { grid-column: 1 / -1; }
-  button.primary { background: var(--acc); border-color: var(--acc); color: #fff; }
-  button.off { background: #2a1416; border-color: #4a2226; }
-  .neutral { background: #f4f1ea; color: #111; } .cool { background: #dfe9ff; color: #111; } .warm { background: #ffd9a8; color: #111; }
-  label { display: block; color: var(--dim); margin: 18px 0 6px; }
-  input[type=range] { width: 100%; height: 40px; accent-color: var(--acc); }
-  .note { color: var(--dim); font-size: 14px; margin-top: 18px; }
+:root {
+  --bg: #0a0a0c; --surface: #151518; --surface-2: #1e1e23; --surface-3: #2a2a31;
+  --line: rgba(255,255,255,.07); --text: #f5f5f7; --muted: #8e8e96; --faint: #5c5c66;
+  --accent: #0a84ff; --good: #30d158; --warn: #ff9f0a; --bad: #ff453a; --on: #ffb45a;
+  --light: 255,180,90; --level: 0; --ease: cubic-bezier(.2,.8,.2,1);
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Inter, Roboto, system-ui, sans-serif;
+  --display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Inter, Roboto, system-ui, sans-serif;
+}
+@media (prefers-color-scheme: light) {
+  :root { --bg: #f2f2f7; --surface: #fff; --surface-2: #f2f2f5; --surface-3: #e5e5ea; --line: rgba(0,0,0,.07);
+    --text: #1d1d1f; --muted: #6e6e73; --faint: #aeaeb2; --accent: #007aff; --good: #34c759; }
+}
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { margin: 0; min-height: 100%; background: var(--bg); }
+body { color: var(--text); font: 17px/1.4 var(--font); -webkit-font-smoothing: antialiased; -webkit-user-select: none; user-select: none;
+  background: radial-gradient(700px 480px at 50% -80px, rgba(var(--light), calc(.22 * var(--level))), transparent 70%), var(--bg);
+  transition: background .6s var(--ease); overscroll-behavior: none; }
+button { font: inherit; color: inherit; cursor: pointer; }
+svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+main { max-width: 480px; margin: 0 auto; padding: max(18px, env(safe-area-inset-top)) 18px max(28px, env(safe-area-inset-bottom)); }
+.top { display: flex; align-items: center; justify-content: space-between; margin: 6px 2px 22px; }
+.top h1 { margin: 0; font: 700 32px/1 var(--display); letter-spacing: -.02em; }
+.pill { display: inline-flex; align-items: center; gap: 7px; height: 30px; padding: 0 12px; border-radius: 999px; background: var(--surface); border: 1px solid var(--line); font-size: 14px; color: var(--muted); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
+.pill.good .dot { background: var(--good); } .pill.warn .dot { background: var(--warn); } .pill.bad .dot { background: var(--bad); }
+
+.hero { border-radius: 28px; background: var(--surface); border: 1px solid var(--line); padding: 20px; margin-bottom: 16px; }
+.strip { position: relative; height: 84px; border-radius: 20px; background: var(--surface-2); overflow: hidden; margin-bottom: 18px; }
+.strip .bar { position: absolute; left: 20px; right: 20px; top: 36px; height: 12px; border-radius: 6px; background: var(--surface-3); transition: all .35s var(--ease); }
+.strip .halo { position: absolute; inset: -40px; background: radial-gradient(closest-side, rgba(var(--light), calc(.55 * var(--level))), transparent); filter: blur(10px); opacity: 0; transition: opacity .4s var(--ease); }
+.strip.lit .halo { opacity: 1; }
+.strip.lit .bar { background: rgb(var(--light)); opacity: calc(.45 + .55 * var(--level)); box-shadow: 0 0 18px rgba(var(--light), calc(.9 * var(--level))), 0 0 60px rgba(var(--light), calc(.5 * var(--level))); }
+.strip.rainbow.lit .bar { background: linear-gradient(90deg, #ff375f, #ff9f0a, #ffd60a, #30d158, #64d2ff, #0a84ff, #bf5af2, #ff375f); background-size: 200% 100%; animation: flow 4s linear infinite; }
+@keyframes flow { to { background-position: -200% 0; } }
+.head { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.head h2 { margin: 0; font: 650 26px/1.1 var(--display); letter-spacing: -.02em; }
+.caption { color: var(--muted); font-size: 15px; margin-top: 3px; min-height: 1.4em; }
+.power { width: 68px; height: 68px; border-radius: 50%; border: 1px solid var(--line); background: var(--surface-2); color: var(--muted); display: grid; place-items: center; transition: all .25s var(--ease); flex: none; }
+.power svg { width: 28px; height: 28px; stroke-width: 2.2; }
+.power.on { background: var(--on); color: #2b1a00; border-color: transparent; box-shadow: 0 10px 30px -10px rgba(255,180,90,.8); }
+.power:active { transform: scale(.93); }
+
+.slider { position: relative; height: 72px; border-radius: 22px; background: var(--surface); border: 1px solid var(--line); overflow: hidden; touch-action: none; margin-bottom: 16px; }
+.slider .fill { position: absolute; inset: 0 auto 0 0; width: 0%; background: linear-gradient(90deg, rgba(var(--light), .55), rgb(var(--light))); transition: width .12s var(--ease); }
+.slider.dragging .fill, .slider.dragging .ink { transition: none; }
+.slider .ink { color: var(--ink, #1d1d1f); clip-path: inset(0 calc(100% - var(--pct, 0%)) 0 0); transition: clip-path .12s var(--ease); }
+.slider.vivid .fill { background: linear-gradient(90deg, #5e5ce6, #bf5af2 55%, #ff375f); }
+.slider.vivid { --ink: #fff; }
+.slider .label { position: absolute; inset: 0; display: flex; align-items: center; gap: 10px; padding: 0 20px; font-weight: 600; pointer-events: none; }
+.slider .pct { margin-left: auto; font-variant-numeric: tabular-nums; }
+.slider.disabled { opacity: .45; pointer-events: none; }
+
+.tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.tile { position: relative; display: flex; flex-direction: column; align-items: flex-start; gap: 10px; min-height: 116px; padding: 16px; border-radius: 22px; border: 1px solid var(--line); background: var(--surface); text-align: left; transition: transform .15s var(--ease), background .2s, border-color .2s; }
+.tile:active { transform: scale(.96); }
+.tile.active { border-color: color-mix(in srgb, var(--accent) 75%, transparent); box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 75%, transparent) inset; background: color-mix(in srgb, var(--accent) 12%, var(--surface)); }
+.tile:disabled { opacity: .45; }
+.tile .check { position: absolute; top: 12px; right: 12px; width: 24px; height: 24px; border-radius: 50%; background: var(--accent); color: #fff; display: grid; place-items: center; transform: scale(0); transition: transform .2s var(--ease); }
+.tile .check svg { width: 14px; height: 14px; stroke-width: 3; }
+.tile.active .check { transform: scale(1); }
+.swatch { width: 36px; height: 36px; border-radius: 50%; box-shadow: 0 0 0 1px rgba(0,0,0,.08) inset; }
+.swatch.sync { background: conic-gradient(#ff375f, #ff9f0a, #ffd60a, #30d158, #64d2ff, #0a84ff, #bf5af2, #ff375f); }
+.swatch.neutral { background: radial-gradient(circle at 35% 35%, #fff, #fff1d9); }
+.swatch.cool { background: radial-gradient(circle at 35% 35%, #fff, #cfe1ff); }
+.swatch.warm { background: radial-gradient(circle at 35% 35%, #fff1dc, #ffae5c); }
+.name { font-weight: 600; } .sub { color: var(--muted); font-size: 13px; margin-top: -8px; }
+
+.connect { text-align: center; padding: 40px 24px 28px; border-radius: 28px; background: var(--surface); border: 1px solid var(--line); }
+.connect .badge { width: 72px; height: 72px; margin: 0 auto 16px; border-radius: 22px; display: grid; place-items: center; background: #5e5ce6; color: #fff; }
+.connect .badge svg { width: 34px; height: 34px; }
+.connect h2 { margin: 0 0 8px; font: 650 24px/1.2 var(--display); }
+.connect p { margin: 0 auto 22px; color: var(--muted); font-size: 15px; max-width: 320px; }
+.primary { width: 100%; height: 54px; border: none; border-radius: 16px; background: var(--accent); color: #fff; font-weight: 600; font-size: 17px; transition: transform .15s var(--ease), filter .2s; }
+.primary:active { transform: scale(.98); filter: brightness(.95); }
+.primary[disabled] { opacity: .6; }
+.foot { text-align: center; margin-top: 18px; }
+.link { background: none; border: none; color: var(--accent); font-size: 15px; padding: 8px; }
+.note { color: var(--muted); font-size: 13px; text-align: center; margin: 14px 8px 0; }
+.toast { position: fixed; left: 50%; bottom: max(24px, env(safe-area-inset-bottom)); transform: translate(-50%, 20px); width: max-content; max-width: calc(100vw - 32px); padding: 12px 18px; border-radius: 16px; background: rgba(40,40,46,.94); color: #fff; font-size: 15px; opacity: 0; pointer-events: none; transition: all .3s var(--ease); }
+.toast.show { opacity: 1; transform: translate(-50%, 0); }
+[hidden] { display: none !important; }
+@media (prefers-color-scheme: light) {
+  /* the preview stays a small night-time scene, and near-white tones get more colour so they read on white */
+  .strip { background: #1c1c1f; } .strip .bar { background: #2e2e34; }
+  .slider { background: var(--surface-3); } .slider:not(.vivid) .fill { filter: saturate(2.6) brightness(.97); }
+  .swatch { box-shadow: 0 0 0 1px rgba(0,0,0,.14) inset; }
+}
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
 </style>
 </head>
 <body>
+<svg style="display:none" aria-hidden="true">
+  <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 3v8"/><path d="M17.7 6.8a8 8 0 1 1-11.4 0"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
+  <symbol id="i-bt" viewBox="0 0 24 24"><path d="M7 7l10 10-5 5V2l5 5L7 17"/></symbol>
+</svg>
 <main>
-  <h1>Lights</h1>
-  <p id="status">Not connected</p>
-  <div class="grid">
-    <button id="connect" class="primary wide">Connect</button>
-    <button class="off" data-cmd='{"on":false}'>Off</button>
-    <button data-cmd='{"on":true}'>On</button>
-    <button class="neutral wide" data-cmd='{"on":true,"bri":255,"lor":2,"seg":{"fx":0,"col":[[0,0,0,255],[0,0,0,0],[0,0,0,0]],"cct":127}}'>Neutral white 100%</button>
-    <button class="cool" data-cmd='{"on":true,"bri":255,"lor":2,"seg":{"fx":0,"col":[[0,0,0,255],[0,0,0,0],[0,0,0,0]],"cct":255}}'>Cool 100%</button>
-    <button class="warm" data-cmd='{"on":true,"bri":255,"lor":2,"seg":{"fx":0,"col":[[0,0,0,255],[0,0,0,0],[0,0,0,0]],"cct":0}}'>Warm 100%</button>
-    <button class="wide" data-cmd='{"on":true,"lor":0}'>Back to SignalRGB</button>
-  </div>
-  <label for="bri">Brightness</label>
-  <input id="bri" type="range" min="1" max="255" value="128">
-  <p class="note">Talks to the bridge over Bluetooth, so your phone stays on its normal Wi-Fi. On iPhone open this page in the
-  Bluefy browser (Safari can't use Bluetooth). The first time, iOS asks for the 6-digit PIN shown on the WLED Link status page,
-  and the bridge only accepts a new phone while pairing is open there.</p>
+  <div class="top"><h1>Lights</h1><span class="pill" id="pill"><span class="dot"></span><span id="pillText">Not connected</span></span></div>
+
+  <section class="connect" id="connectView">
+    <div class="badge"><svg><use href="#i-bt"/></svg></div>
+    <h2 id="connectTitle">Connect to your light</h2>
+    <p id="connectText">Your phone talks to the bridge over Bluetooth, so it stays on its normal Wi-Fi.</p>
+    <button class="primary" id="connect">Connect</button>
+    <p class="note">First time? Open pairing on the PC's Lights page, then enter the 6-digit PIN when iOS asks.</p>
+  </section>
+
+  <section id="controlView" hidden>
+    <div class="hero">
+      <div class="strip" id="strip"><div class="halo"></div><div class="bar"></div></div>
+      <div class="head">
+        <div style="min-width:0"><h2 id="title">—</h2><div class="caption" id="caption"></div></div>
+        <button class="power" id="power" aria-label="Turn the light on or off"><svg><use href="#i-power"/></svg></button>
+      </div>
+    </div>
+    <div class="slider" id="bri" role="slider" aria-label="Brightness" aria-valuemin="1" aria-valuemax="100">
+      <div class="fill"></div>
+      <div class="label"><svg><use href="#i-sun"/></svg><span>Brightness</span><span class="pct" id="briText">—</span></div>
+      <div class="label ink" aria-hidden="true"><svg><use href="#i-sun"/></svg><span>Brightness</span><span class="pct" id="briInk">—</span></div>
+    </div>
+    <div class="tiles">
+      <button class="tile" data-mode="sync"><span class="check"><svg><use href="#i-check"/></svg></span><span class="swatch sync"></span><span class="name">PC Sync</span><span class="sub">SignalRGB</span></button>
+      <button class="tile" data-mode="neutral"><span class="check"><svg><use href="#i-check"/></svg></span><span class="swatch neutral"></span><span class="name">Neutral</span><span class="sub">Both whites, full</span></button>
+      <button class="tile" data-mode="cool"><span class="check"><svg><use href="#i-check"/></svg></span><span class="swatch cool"></span><span class="name">Cool</span><span class="sub">6000 K, full</span></button>
+      <button class="tile" data-mode="warm"><span class="check"><svg><use href="#i-check"/></svg></span><span class="swatch warm"></span><span class="name">Warm</span><span class="sub">3000 K, full</span></button>
+    </div>
+    <div class="foot"><button class="link" id="disconnect">Disconnect</button></div>
+  </section>
 </main>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
 <script>
+"use strict";
 const SVC = "8d2a0001-3c55-4b6e-a7f1-6f2b5c0e9a41";
 const CMD = "8d2a0002-3c55-4b6e-a7f1-6f2b5c0e9a41";
 const STATE = "8d2a0003-3c55-4b6e-a7f1-6f2b5c0e9a41";
+const TONES = {warm: [255, 176, 96], neutral: [255, 242, 222], cool: [214, 229, 255]};
 const $ = (id) => document.getElementById(id);
-let device = null, cmdChr = null, stateChr = null, lastN = -1, busy = false, queued = null;
+// PC Sync: "live": false restarts WLED's live session, which blanks the strip first, so LEDs that
+// SignalRGB doesn't cover go dark instead of keeping the old colour (see SYNC_STATE in wledlink.py).
+const SYNC = {on: true, lor: 0, live: false, seg: {fx: 0, col: [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]}};
+let device = null, cmdChr = null, stateChr = null, state = {}, wantConnected = false, linkState = "idle";
+const hold = {};  // optimistic values shown until the light confirms: {field: {value, until}}
 
-function setStatus(text, cls = "") { $("status").textContent = text; $("status").className = cls; }
-function setEnabled(on) {
-  document.querySelectorAll("[data-cmd]").forEach((b) => (b.disabled = !on));
-  $("bri").disabled = !on;
-  $("connect").style.display = on ? "none" : "";
+// ---------- state ----------
+function light() {
+  const l = Object.assign({}, state), now = Date.now();
+  for (const [k, h] of Object.entries(hold)) if (h.until > now) l[k] = h.value; else delete hold[k];
+  return l;
+}
+function optimistic(values, ms = 1500) {
+  const until = Date.now() + ms;
+  for (const [k, v] of Object.entries(values)) hold[k] = {value: v, until};
+  render();
+}
+function modeOf(l) {
+  if (!l.ws || l.on === undefined || l.on < 0) return "unknown";
+  if (!l.on) return "off";
+  if (!l.lor) return l.live ? "sync" : "effects";
+  if (l.ps > 0) return "preset";
+  const c = l.col || [];
+  const whiteOnly = l.fx === 0 && ((c[3] > 0 && !c[0] && !c[1] && !c[2]) || (c[0] === 255 && c[1] === 255 && c[2] === 255 && !c[3]));
+  if (whiteOnly) return l.cct <= 63 ? "warm" : l.cct >= 192 ? "cool" : "neutral";
+  return "custom";
+}
+function render() {
+  const connected = linkState === "ready";
+  $("connectView").hidden = connected;
+  $("controlView").hidden = !connected;
+  const pill = $("pill"), retrying = !connected && wantConnected && device;
+  pill.className = "pill " + (connected ? (state.ws ? "good" : "warn") : linkState === "connecting" || retrying ? "warn" : "");
+  $("pillText").textContent = connected ? (state.ws ? "Connected" : "Light offline")
+    : linkState === "connecting" ? "Connecting" : retrying ? "Reconnecting" : "Not connected";
+  $("connect").disabled = linkState === "connecting";
+  $("connect").textContent = linkState === "connecting" ? "Connecting…" : "Connect";
+  $("connectTitle").textContent = retrying ? "Reconnecting…" : "Connect to your light";
+  if (navigator.bluetooth) $("connectText").textContent = retrying
+    ? "Looking for the light. It reconnects by itself as soon as the bridge is back."
+    : "Your phone talks to the bridge over Bluetooth, so it stays on its normal Wi-Fi.";
+  if (!connected) { document.documentElement.style.setProperty("--level", 0); return; }
+
+  const l = light(), mode = modeOf(l);
+  const on = mode !== "off" && mode !== "unknown";
+  const pct = l.bri > 0 ? Math.max(1, Math.round(l.bri / 2.55)) : 0;
+  let rgb = [70, 70, 80], rainbow = false;
+  if (mode in TONES) rgb = TONES[mode];
+  else if (mode === "sync" || mode === "effects" || mode === "preset") rainbow = true;
+  else if (mode === "custom" && l.col) rgb = l.col.slice(0, 3);
+  document.documentElement.style.setProperty("--light", rgb.join(","));
+  document.documentElement.style.setProperty("--level", on ? Math.max(.25, (l.bri || 0) / 255).toFixed(3) : 0);
+  $("strip").classList.toggle("lit", on);
+  $("strip").classList.toggle("rainbow", rainbow);
+  const names = {off: "Off", sync: "PC Sync", effects: "WLED effect", preset: "Preset", neutral: "Neutral white",
+                 cool: "Cool white", warm: "Warm white", custom: "Custom colour", unknown: "Light offline"};
+  $("title").textContent = names[mode];
+  $("caption").textContent = mode === "sync" ? "Following SignalRGB" : mode === "unknown" ? "The bridge can't reach WLED right now"
+    : mode === "off" ? "Tap power or pick a mode" : mode === "effects" ? `SignalRGB isn't sending · ${pct}%` : `${pct}% brightness`;
+  $("power").classList.toggle("on", on);
+  const slider = $("bri");
+  slider.classList.toggle("disabled", mode === "unknown");
+  slider.classList.toggle("vivid", rainbow);
+  if (!slider.classList.contains("dragging")) setSlider(on ? pct : 0, on ? pct + "%" : "Off");
+  document.querySelectorAll(".tile").forEach((t) => { t.classList.toggle("active", t.dataset.mode === mode); t.disabled = mode === "unknown"; });
 }
 
-async function readState() {
-  const s = JSON.parse(new TextDecoder().decode(await stateChr.readValue()));
-  if (s.ok) {
-    setStatus(`${s.on ? "On" : "Off"}, brightness ${Math.round((s.bri / 255) * 100)}%${s.lor ? " (SignalRGB paused)" : ""}`, "ok");
-    if (s.bri > 0) $("bri").value = s.bri;
-  } else if (s.err) {
-    setStatus(s.err, "bad");
+function setSlider(p, text) {
+  const el = $("bri");
+  el.querySelector(".fill").style.width = p + "%";
+  el.style.setProperty("--pct", p + "%");
+  $("briText").textContent = $("briInk").textContent = text;
+}
+
+// ---------- Bluetooth ----------
+let queue = null, writing = false;
+async function send(cmd) {
+  if (!cmdChr) return;
+  queue = Object.assign({tt: 0}, cmd);  // only the newest command matters if taps pile up
+  if (writing) return;
+  writing = true;
+  try {
+    while (queue) {
+      const data = new TextEncoder().encode(JSON.stringify(queue));
+      queue = null;
+      if (cmdChr.writeValueWithoutResponse) await cmdChr.writeValueWithoutResponse(data);  // fastest: no round trip
+      else await cmdChr.writeValue(data);
+    }
+  } catch (e) {
+    toast("Couldn't reach the light");
+  } finally {
+    writing = false;
   }
-  return s;
 }
-
+function onState(value) {
+  try { state = JSON.parse(new TextDecoder().decode(value)); } catch (e) { return; }
+  render();
+}
 async function attach(dev) {
   device = dev;
-  device.addEventListener("gattserverdisconnected", () => { setEnabled(false); setStatus("Disconnected"); });
-  setStatus("Connecting…");
-  const server = await device.gatt.connect();
+  wantConnected = true;
+  if (!dev._wl) {
+    dev._wl = true;
+    dev.addEventListener("gattserverdisconnected", () => {
+      cmdChr = stateChr = null;
+      linkState = "idle";
+      render();
+      if (wantConnected) setTimeout(() => reconnect(), 600);
+    });
+  }
+  linkState = "connecting";
+  render();
+  const server = await dev.gatt.connect();
   const svc = await server.getPrimaryService(SVC);
   cmdChr = await svc.getCharacteristic(CMD);
   stateChr = await svc.getCharacteristic(STATE);
-  setStatus("Pairing… (type the PIN if iOS asks)");
-  await send({});  // reading the encrypted state is what triggers pairing the first time
-  setEnabled(true);
+  stateChr.addEventListener("characteristicvaluechanged", (e) => onState(e.target.value));
+  onState(await stateChr.readValue());   // the first encrypted read is what makes iOS ask for the PIN
+  await stateChr.startNotifications();   // from now on the bridge pushes every change
+  linkState = "ready";
+  try { localStorage.setItem("wl-paired", "1"); } catch (e) {}
+  render();
 }
-
-async function send(cmd) {
-  if (!cmdChr) return;
-  if (busy) { queued = cmd; return; }  // the latest tap wins once the current one is done
-  busy = true;
-  try {
-    await cmdChr.writeValueWithResponse(new TextEncoder().encode(JSON.stringify(cmd)));
-    const start = Date.now();
-    let s = await readState();
-    while (s.n === lastN && Date.now() - start < 5000) {  // the bridge answers once WLED has taken the command
-      await new Promise((r) => setTimeout(r, 250));
-      s = await readState();
-    }
-    lastN = s.n;
-  } catch (e) {
-    setStatus(`Didn't work: ${e.message}`, "bad");
-  } finally {
-    busy = false;
-    if (queued) { const next = queued; queued = null; send(next); }
+// Keeps trying for as long as the page is open (the bridge may be off while the PC sleeps), backing off
+// to every 8 s; coming back to the page tries again at once.
+let retries = 0, retryTimer = null;
+async function reconnect() {
+  clearTimeout(retryTimer);
+  if (!device || !wantConnected || linkState === "connecting" || device.gatt.connected) return;
+  try { await attach(device); retries = 0; }
+  catch (e) {
+    linkState = "idle"; render();
+    if (!document.hidden) retryTimer = setTimeout(reconnect, Math.min(8000, 800 * 2 ** Math.min(++retries, 4)));
   }
 }
-
 $("connect").addEventListener("click", async () => {
-  if (!navigator.bluetooth) { setStatus("This browser has no Bluetooth. On iPhone use the Bluefy app.", "bad"); return; }
+  if (!navigator.bluetooth) { toast("This browser has no Bluetooth. On iPhone, open this page in Bluefy."); return; }
   try {
-    await attach(await navigator.bluetooth.requestDevice({ filters: [{ services: [SVC] }] }));
+    const dev = device || await navigator.bluetooth.requestDevice({filters: [{services: [SVC]}]});
+    await attach(dev);
   } catch (e) {
-    setStatus(`Couldn't connect: ${e.message}`, "bad");
+    linkState = "idle"; render();
+    if (e && e.name !== "NotFoundError") toast(/security|auth|insufficient/i.test(e.message) ? "Pairing wasn't accepted. Open pairing on the PC and try again." : "Couldn't connect. Is the bridge powered?");
   }
 });
-document.querySelectorAll("[data-cmd]").forEach((b) => b.addEventListener("click", () => send(JSON.parse(b.dataset.cmd))));
-$("bri").addEventListener("change", (e) => send({ on: true, bri: +e.target.value }));
+$("disconnect").addEventListener("click", () => { wantConnected = false; if (device && device.gatt.connected) device.gatt.disconnect(); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden && device && !device.gatt.connected && wantConnected) { retries = 0; reconnect(); } });
 
-setEnabled(false);
-// Reconnect to the lamp picked last time without the chooser, where the browser allows it.
-if (navigator.bluetooth && navigator.bluetooth.getDevices) {
-  navigator.bluetooth.getDevices().then((devs) => { if (devs[0]) attach(devs[0]).catch(() => setStatus("Tap Connect")); });
+// ---------- controls ----------
+$("power").addEventListener("click", () => {
+  const on = modeOf(light()) === "off";
+  optimistic({on: on ? 1 : 0});
+  send({on});
+});
+document.querySelectorAll(".tile").forEach((t) => t.addEventListener("click", () => {
+  const m = t.dataset.mode;
+  if (m === "sync") { optimistic({on: 1, lor: 0, live: 1, fx: 0, col: [0, 0, 0, 0]}); send(SYNC); return; }
+  const cct = {neutral: 127, cool: 255, warm: 0}[m];
+  optimistic({on: 1, bri: 255, lor: 2, ps: -1, fx: 0, cct, col: [0, 0, 0, 255]});
+  send({on: true, bri: 255, lor: 2, seg: {fx: 0, col: [[0, 0, 0, 255], [0, 0, 0, 0], [0, 0, 0, 0]], cct}});
+}));
+(function () {
+  const el = $("bri");
+  let dragging = false, last = 0, timer = null, pending = null;
+  const pctAt = (x) => { const r = el.getBoundingClientRect(); return Math.min(100, Math.max(1, Math.round(((x - r.left) / r.width) * 100))); };
+  const show = (p) => setSlider(p, p + "%");
+  function commit(p, final) {
+    optimistic({on: 1, bri: Math.round(p * 2.55)});
+    pending = p;
+    const due = 40 - (Date.now() - last);
+    if (final || due <= 0) flush(); else if (!timer) timer = setTimeout(flush, due);
+  }
+  function flush() { clearTimeout(timer); timer = null; if (pending == null) return; last = Date.now(); send({on: true, bri: Math.round(pending * 2.55)}); pending = null; }
+  el.addEventListener("pointerdown", (e) => { dragging = true; el.setPointerCapture(e.pointerId); el.classList.add("dragging"); const p = pctAt(e.clientX); show(p); commit(p); });
+  el.addEventListener("pointermove", (e) => { if (dragging) { const p = pctAt(e.clientX); show(p); commit(p); } });
+  const end = (e) => { if (!dragging) return; dragging = false; el.classList.remove("dragging"); commit(pctAt(e.clientX), true); };
+  el.addEventListener("pointerup", end);
+  el.addEventListener("pointercancel", end);
+})();
+
+let toastTimer;
+function toast(text) {
+  const t = $("toast");
+  t.textContent = text; t.className = "toast show";
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => (t.className = "toast"), 4000);
 }
+
+// Reconnect straight away to a light used before, where the browser allows it (no device picker).
+if (navigator.bluetooth && navigator.bluetooth.getDevices) {
+  navigator.bluetooth.getDevices().then((devs) => {
+    const dev = devs.find((d) => d.name === "Lamp") || devs[0];
+    if (dev) { device = dev; wantConnected = true; reconnect(); }
+  }).catch(() => {});
+}
+if (!navigator.bluetooth) $("connectText").textContent = "This browser can't use Bluetooth. On iPhone, open this page in the Bluefy app.";
+render();
 </script>
 </body>
 </html>

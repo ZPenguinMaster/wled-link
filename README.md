@@ -7,7 +7,7 @@ were on a normal home network.
 
 ```
  SignalRGB ─┐                                    ┌──────────────────────┐
-            ├─► 127.0.0.2 ─► wledlink.py ─USB──► │ bridge ESP32 (spare) │
+            ├─► 127.0.0.2 ─► wledlink.py ─USB──► │ bridge ESP32 (spare) │ ◄── Bluetooth ── phone
  browser  ──┘   (this PC)                        └──────────┬───────────┘
                                                             │ hidden Wi-Fi "WLEDLink"
                                                  ┌──────────▼───────────┐
@@ -16,7 +16,8 @@ were on a normal home network.
 ```
 
 Everything WLED does keeps working: the full web UI (including settings and firmware updates),
-presets, the JSON API, and SignalRGB's realtime colours.
+presets, the JSON API, and SignalRGB's realtime colours. On top of that you get a control page on
+the PC and a Bluetooth remote for your phone, and both react the moment you tap.
 
 | Folder | What it is |
 |---|---|
@@ -24,6 +25,7 @@ presets, the JSON API, and SignalRGB's realtime colours.
 | `pc/wledlink.py` | The PC side. Needs only Python + pyserial. |
 | `pc/install-autostart.ps1` | Starts `wledlink.py` in the background at every login. |
 | `pc/tests/` | End-to-end test with a simulated bridge and WLED (`python pc\tests\test_wledlink.py`). |
+| `wled/` | WLED for the light with quicker reconnects (see *Staying connected*), and how to rebuild it. |
 
 **Bridge Wi-Fi:** network `WLEDLink` (hidden), password `quartz-basil-1769` (set in `bridge/src/config.h`).
 
@@ -40,16 +42,26 @@ presets, the JSON API, and SignalRGB's realtime colours.
    The tool refuses to flash a board that answers as WLED, so you can't overwrite the lights by accident.
    If it gets stuck on `Connecting...`, hold the board's **BOOT** button until writing starts.
 
+To update the bridge later, run the same command again. It pauses a running link while it works and
+keeps the bridge's settings, Bluetooth PIN and paired phones (`--reset-settings` wipes them back to the
+defaults in `bridge/src/config.h`). Older bridge firmware keeps working with the newest `wledlink.py`,
+just without Bluetooth and with slower status updates.
+
 ## 2. Start the link
 
 ```
 python pc\wledlink.py
 ```
-Open **http://127.0.0.2/__wledlink**. The status page walks you through the remaining steps and
-shows what's connected. To have it start by itself at every login (in the background, no window),
-double-click **`pc\install-autostart.cmd`**. The window stays open so you can read the result.
-`install-autostart.cmd -Uninstall` removes it again, and `python pc\wledlink.py stop` stops a
-background copy.
+Open **http://127.0.0.2/__wledlink**. That's the Lights control page: power, brightness, the modes
+(PC Sync and the three whites), your WLED presets, phone pairing, and the settings. Until everything
+is connected it also walks you through the remaining steps.
+
+**Keep it running:** double-click **`pc\install-autostart.cmd`** once. It sets up a Windows scheduled
+task that runs the link in the background (no window) and starts it at log-in, when the PC wakes up or is
+unlocked, and, as a watchdog, within a minute whenever it isn't running for any reason. The window stays
+open so you can read the result. `install-autostart.cmd -Uninstall` removes it again. `python
+pc\wledlink.py stop` stops the running copy, but with the watchdog installed it comes back within a
+minute; uninstall autostart to keep it off.
 
 The bridge's blue LED shows its state: a short blip every 2 s means it's waiting for the PC program,
 steady blinking means the PC is connected but WLED hasn't joined, and solid (flickering with traffic)
@@ -73,8 +85,8 @@ shows up in a scan.
 Also in WiFi Setup, keep **Disable WiFi sleep** checked (the default on ESP32). It keeps realtime colours smooth.
 
 **WLED's backup hotspot:** by default, if WLED starts up without the bridge (say the PC is off when the
-lights get power), it opens its own hidden `WLED-AP` hotspot at http://4.3.2.1. The status page and
-`python pc\wledlink.py wled-hotspot off|boot|fallback` choose when that happens: never, only in that boot
+lights get power), it opens its own hidden `WLED-AP` hotspot at http://4.3.2.1. The *WLED backup hotspot*
+setting on the control page and `python pc\wledlink.py wled-hotspot off|boot|fallback` choose when that happens: never, only in that boot
 case (WLED's default), or whenever WLED loses the bridge. With it off, the way to fix WLED's Wi-Fi if
 it ever gets lost is over USB with `wled-wifi`.
 
@@ -82,12 +94,14 @@ it ever gets lost is over USB with `wled-wifi`.
 
 The bridge also runs a Bluetooth light control, named "Lamp". Your phone talks to it over Bluetooth
 and stays on its normal Wi-Fi, and the bridge passes the commands on to WLED.
-[pc/phone/index.html](pc/phone/index.html) is the control page: On/Off, the three whites at 100%,
-Back to SignalRGB, and brightness.
+[pc/phone/index.html](pc/phone/index.html) is the phone's control page, built like the one on the PC:
+power, a brightness slider, and tiles for PC Sync and the three whites at 100%. The bridge pushes every
+change to the phone, so the page also shows what you did on the PC, and the other way round. It
+reconnects by itself when you come back to it.
 
 **Locked to your phone:** the control only works over an encrypted link paired with a 6-digit PIN, shown
-on the status page. On top of that, the bridge only accepts phones that paired while you had pairing open:
-2 minutes, started from the status page (or `python pc\wledlink.py phone pair`, or by holding the bridge's
+on the control page. On top of that, the bridge only accepts phones that paired while you had pairing open:
+2 minutes, started from the control page (or `python pc\wledlink.py phone pair`, or by holding the bridge's
 BOOT button for 2 s, when its LED blinks fast). Anyone else is disconnected.
 
 **One-time setup on the iPhone:**
@@ -97,11 +111,11 @@ BOOT button for 2 s, when its LED blinks fast). Anyone else is disconnected.
    `https://<your-username>.github.io/lights/`. It contains no PIN or password.
 2. Install **Bluefy** from the App Store (Safari can't use Bluetooth) and open that address in it.
    Add it to Bluefy's favourites.
-3. On the laptop's status page, press **Let a new phone pair**. In Bluefy tap **Connect**, choose **Lamp**,
+3. On the laptop's control page, press **Pair a phone**. In Bluefy tap **Connect**, choose **Lamp**,
    and type the PIN when iOS asks.
 
-After that, open the page in Bluefy, tap Connect → Lamp, and use the buttons. This works with the laptop
-off as long as the bridge still gets USB power. To start over, use *Forget paired phones* (and remove
+After that, open the page in Bluefy (tap Connect → Lamp if it doesn't connect by itself) and use it. This works with the laptop
+off as long as the bridge still gets USB power. To start over, use *Forget phones* (and remove
 "Lamp" under iPhone Settings → Bluetooth); `python pc\wledlink.py phone pin 482913` changes the PIN.
 
 ## Controlling it from your phone over Wi-Fi
@@ -135,8 +149,8 @@ to 127.0.0.2:21324 and `wledlink.py` forwards it.
 
 While SignalRGB is streaming, WLED follows it and ignores its own effects. To take over for white:
 
-- **Status page:** *Neutral white 100%* (warm and cool white LEDs both at full), *Cool white 100%*,
-  *Warm white 100%*, and *Back to SignalRGB*. The RGB LEDs stay off for all three.
+- **Control page or phone:** *Neutral* (warm and cool white LEDs both at full), *Cool*, *Warm*, and
+  *PC Sync* to hand back to SignalRGB. The RGB LEDs stay off for all three whites.
 - **WLED's own UI** (http://127.0.0.2): it shows *Override once* / *Override until reboot* buttons while
   SignalRGB is streaming. Pick a white preset, then press the star in the top-left to go back to SignalRGB.
 - **Command line / shortcuts:**
@@ -147,6 +161,11 @@ While SignalRGB is streaming, WLED follows it and ignores its own effects. To ta
   python pc\wledlink.py signalrgb                 # hand control back
   python pc\wledlink.py off
   ```
+
+*PC Sync* also sets WLED's own colour to black and restarts its live session, which blanks the whole
+strip before SignalRGB's next frame. LEDs that your SignalRGB layout leaves out stay dark instead of
+keeping whatever colour they had, and when SignalRGB stops (PC asleep or off) the strip goes dark rather
+than falling back to an old colour.
 
 Both whites at full needs WLED's **CCT additive blending** at 100% (Config → LED Preferences). At the
 default 0%, the middle of the white range gives each channel only half. The first press of *Neutral*
@@ -159,13 +178,32 @@ BTF-Lighting's recommended WLED LED setup for it is **FW1906 GRBCW**, colour ord
 warm/cool white swapped. A 5 m strip has 80 of those segments. If effects look squashed, or only part
 of a SignalRGB gradient reaches the strip, check the LED count in WLED's LED Preferences.
 
+## Staying connected
+
+Anything can be unplugged, restarted or put to sleep; everything finds its way back without you doing anything.
+Times measured on this setup:
+
+| What happens | What you notice |
+|---|---|
+| WLED Link crashes or gets closed | The autostart watchdog starts it again within a minute (an internal error restarts it within 5 s). |
+| The bridge is unplugged and plugged back in, or the laptop wakes up | Lights and controls are back about 5 s after the bridge gets power again, on any USB port. |
+| The bridge restarts (update, settings change) | About 6 s. |
+| WLED loses power | Back as soon as WLED has started up and rejoined (about 6 s); the bridge notices within half a second. |
+| The laptop sleeps | WLED keeps its last look; SignalRGB takes over again when the laptop wakes. |
+| The phone page loses the bridge | It keeps trying for as long as the page is open, and reconnects the moment the bridge is back. |
+
+The 5 s after an outage depends on the light running the **WLED Link build of WLED** in [`wled/`](wled/README.md)
+(installed with `python pc\wledlink.py wled-update`). It is the official WLED 16.0.1 with one change: it looks
+for the bridge's Wi-Fi every 5 s instead of every 18 s after losing it, so with stock WLED the same wait can
+be up to about 20 s. Official WLED updates replace it; `wled\build.ps1` rebuilds it on a newer version.
+
 ## Commands
 
 | Command | Does |
 |---|---|
 | `python pc\wledlink.py` | Run the link (same as `run`). `--port COM5` skips auto-detection. |
 | `python pc\wledlink.py status` | Show the bridge, the devices on its Wi-Fi, WLED, and traffic counters. |
-| `python pc\wledlink.py stop` | Stop the running link (handy when it runs in the background). |
+| `python pc\wledlink.py stop` | Stop the running link. With autostart installed, its watchdog starts it again within a minute. |
 | `python pc\wledlink.py white [neutral\|cool\|warm]` | White LEDs at full, overriding SignalRGB. `--brightness 60` for less. |
 | `python pc\wledlink.py signalrgb` / `off` | Hand control back to SignalRGB / turn the lights off. |
 | `python pc\wledlink.py phone pair\|forget\|pin NNNNNN` | Bluetooth phone control: open pairing for 2 min, forget phones, change the PIN. |
@@ -173,24 +211,32 @@ of a SignalRGB gradient reaches the strip, check the LED count in WLED's LED Pre
 | `python pc\wledlink.py bridge-config --wifi always\|with-pc` | Bridge Wi-Fi on whenever it has power (default, needed for phone control with the PC off) or only while the program runs. |
 | `python pc\wledlink.py ports` | List serial ports. |
 | `python pc\wledlink.py bridge-config --password NEW --channel 6` | Change the bridge Wi-Fi (the bridge restarts). Give WLED the new details too. |
-| `python pc\wledlink.py flash-bridge --port COMx` | Flash `bridge/prebuilt/wledlink-bridge.bin`. |
+| `python pc\wledlink.py flash-bridge --port COMx` | Flash `bridge/prebuilt/wledlink-bridge.bin`, keeping the bridge's settings and paired phones (`--reset-settings` to wipe them). |
 | `python pc\wledlink.py wled-wifi --port COMy` | Point a USB-connected WLED board at the bridge Wi-Fi. |
+| `python pc\wledlink.py wled-update [file.bin]` | Install WLED firmware on the light through the link (default: the WLED Link build in `wled/prebuilt/`), keeping its look. |
 
-To rebuild the firmware after editing `bridge/src/config.h`: `cd bridge`, then `python -m platformio run -t upload --upload-port COMx`.
-Flashing the prebuilt image resets any `bridge-config` changes to the defaults in `config.h`.
+To rebuild the firmware after editing `bridge/src/config.h`: `cd bridge`, `python -m platformio run` (this also
+refreshes the prebuilt image), then `flash-bridge`. Settings saved with `bridge-config` take priority over
+`config.h`; `flash-bridge --reset-settings` goes back to `config.h`.
 
 ## Troubleshooting
 
-- **The status page says what's missing.** Logs are in `%LOCALAPPDATA%\wledlink\wledlink.log`.
-- **"Cannot listen on 127.0.0.2:80"**: another copy is already running, maybe in the background. `python pc\wledlink.py stop` ends it.
+- **The control page says what's missing.** Logs are in `%LOCALAPPDATA%\wledlink\wledlink.log`.
+- **"Cannot listen on 127.0.0.2:80"** in the log: another program is using that address. (A second copy of
+  WLED Link just exits quietly, so that isn't it.)
 - **WLED joined but isn't reachable**: WLED still has a static IP from the campus network. Set it to `0.0.0.0`.
 - **Neutral white flickers, or the power supply clicks off**: both white channels at full is the most the whites
   can draw. BTF recommends a 24 V 4 A (96 W) supply for the 5 m strip. With a smaller one, use less brightness
   (`white neutral --brightness 70`).
-- **Colours stutter**: the bridge picks the quietest of channels 1/6/11 at each start. In a crowded
+- **Colours stutter**: the bridge picks the quietest of channels 1/6/11 when it powers up (a restart keeps it). In a crowded
   dorm you can pin one: `python pc\wledlink.py bridge-config --channel 11`.
-- **After the PC sleeps**: the bridge loses USB power and WLED keeps its last look. On wake everything
-  reconnects on its own within about half a minute.
+- **After the PC sleeps**: laptops like this one (S3 sleep) usually cut USB power, so the bridge restarts when it wakes. WLED
+  keeps its last look meanwhile and rejoins a few seconds after the bridge is back (see *Staying connected*).
+  Plugged into a USB port that stays powered in sleep (often marked with a battery or lightning icon) or a
+  powered USB hub, the bridge never goes away: the lights pick up the moment the PC wakes, and phone control
+  works while the laptop sleeps.
+- **Didn't start, or stopped**: with autostart installed, the watchdog starts it within a minute. The log
+  (`%LOCALAPPDATA%\wledlink\wledlink.log`) records unexpected errors with details.
 - **Reflashing the bridge while the link runs** is fine. `flash-bridge` pauses the link while it works.
 
 ## Purdue's rules
@@ -213,13 +259,30 @@ build on the light controller.
 ## How it works
 
 The bridge firmware hosts a hidden WPA2 access point on its own subnet (192.168.77.x) that isn't connected to
-anything else, and tunnels TCP and UDP over the USB serial link at 921600 baud. Frames are COBS-encoded with a
+anything else, and tunnels TCP and UDP over the USB serial link at 921600 baud, or 2 Mbaud when the board's
+USB chip can take it (CP2102N and CH340 can, the older CP2102 can't; `wledlink.py` tries once and falls back). Frames are COBS-encoded with a
 CRC and a sequence number. Any corruption resets the session instead of silently mangling data, and each
 tunnelled connection has flow control so large uploads (like WLED firmware updates) can't overrun the ESP32.
 `wledlink.py` serves 127.0.0.2:80 and the WLED UDP ports, finds WLED among the devices on the bridge network,
 and rewrites the `"ip"` field in WLED's `/json` info. SignalRGB reads that field and would otherwise try to
 reach the bridge-side address directly. It also hands WLED the PC's clock now and then, since WLED has no
 internet for NTP here.
+
+**Why taps feel instant.** Every control path takes the shortest route and nothing waits for a reply:
+- The bridge keeps a WebSocket open to WLED. Commands from the PC page, the phone and the command line go
+  straight over it: no new connection or HTTP request per tap.
+- The moment the bridge forwards a command, it pushes the resulting state to the PC (over USB) and to the phone
+  (as a Bluetooth notification). The pages redraw before WLED has even finished, and WLED's own report follows
+  to confirm. Pages also redraw locally the instant you touch them.
+- Every command carries `"tt":0`, so WLED switches without its usual 0.7 s fade. The *Instant changes*
+  switch sets WLED's default fade to 0 as well, for everything else (WLED's own UI, presets).
+- Brightness drags send at most 20 (PC) or 25 (phone) updates a second, always the newest, so a drag
+  never builds a queue. On the phone, commands are Bluetooth writes without a response, and the
+  bridge asks for a 15–30 ms connection interval (the fastest Apple allows) once your phone is paired.
+- WLED doesn't announce when a SignalRGB stream starts or stops, but every stream passes through the
+  bridge, so the bridge tells the pages itself.
+
+Through the simulated link in `pc/tests`, a click on the PC page shows up on every open page in about 16 ms.
 
 **Security.** The link only listens on this PC's loopback address, so other machines can't reach it. It
 also refuses requests that come from other websites open in your browser: cross-site requests, POSTs

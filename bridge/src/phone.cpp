@@ -1,21 +1,18 @@
 #include "phone.h"
 
-#include <HTTPClient.h>
 #include <NimBLEDevice.h>
 #include <Preferences.h>
-#include <WiFi.h>
-#include <esp_netif.h>
-#include <esp_netif_sta_list.h>
-#include <esp_wifi.h>
 
 #include "config.h"
+#include "wled.h"
 
 // The phone page (pc/phone/index.html) uses the same UUIDs.
 static const char* SVC_UUID = "8d2a0001-3c55-4b6e-a7f1-6f2b5c0e9a41";
 static const char* CMD_UUID = "8d2a0002-3c55-4b6e-a7f1-6f2b5c0e9a41";    // write: WLED JSON state, e.g. {"on":false}
-static const char* STATE_UUID = "8d2a0003-3c55-4b6e-a7f1-6f2b5c0e9a41";  // read: {"n":seq,"ok":1,"on":..,"bri":..,"lor":..}
+static const char* STATE_UUID = "8d2a0003-3c55-4b6e-a7f1-6f2b5c0e9a41";  // read/notify: the light's state (wledStateJson)
 
-static const int MAX_PHONES = 4;
+static const int MAX_PHONES = 3;  // NimBLE keeps 3 bonds (CONFIG_BT_NIMBLE_MAX_BONDS)
+static const int MAX_CONN = 3;
 static const int BOOT_BUTTON = 0;
 static const uint32_t UNPAIRED_KICK_MS = 30000;  // connections that don't pair in time get dropped
 
@@ -24,30 +21,37 @@ struct PhoneId {
   uint8_t addr[6];
 };
 
-struct Job {
-  uint16_t len;  // 0 = just refresh the state
-  bool fromPc;
-  char json[512];
+struct Link {
+  uint16_t handle = 0xFFFF;  // 0xFFFF = unused
+  uint32_t since = 0;
+  bool approved = false;      // paired, and one of our phones
+  bool subscribed = false;    // asked for state notifications
 };
 
 static PhoneId phones[MAX_PHONES];
 static int numPhones = 0;
+static Link links[MAX_CONN];
 static uint32_t pin = 0;
 static volatile uint32_t pairingUntil = 0;
 static NimBLEServer* server = nullptr;
 static NimBLECharacteristic* stateChr = nullptr;
-static QueueHandle_t jobs = nullptr;
-static uint32_t wledIp = 0;  // network byte order, 0 = not found yet
-static uint32_t seq = 0;
-
-static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
-static char pcResult[200];
-static volatile bool pcResultReady = false;
-static uint16_t pendingConn[4] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
-static uint32_t pendingSince[4];
+static portMUX_TYPE listMux = portMUX_INITIALIZER_UNLOCKED;  // phones[] and links[] are shared with the BLE task
 
 // ---------------------------------------------------------------------------------------------
 // paired phones (our own allowlist, on top of NimBLE's bond store)
+
+static void savePhones() {
+  PhoneId copy[MAX_PHONES];
+  portENTER_CRITICAL(&listMux);
+  int n = numPhones;
+  memcpy(copy, phones, sizeof copy);
+  portEXIT_CRITICAL(&listMux);
+  Preferences p;
+  if (p.begin("wlble", false)) {
+    p.putBytes("ids", copy, n * sizeof(PhoneId));
+    p.end();
+  }
+}
 
 static void loadPhones() {
   Preferences p;
@@ -56,7 +60,7 @@ static void loadPhones() {
     pin = p.getUInt("pin", 0);
     p.end();
   }
-  if (pin == 0 || pin > 999999 || pin == 123456) {  // 123456 is NimBLE's "ask the callback" value
+  if (pin < 100000 || pin > 999999 || pin == 123456) {  // 123456 is NimBLE's "ask the callback" value
     do pin = esp_random() % 1000000; while (pin < 100000 || pin == 123456);
     Preferences w;
     if (w.begin("wlble", false)) {
@@ -65,16 +69,6 @@ static void loadPhones() {
     }
   }
 }
-
-static void savePhones() {
-  Preferences p;
-  if (p.begin("wlble", false)) {
-    p.putBytes("ids", phones, numPhones * sizeof(PhoneId));
-    p.end();
-  }
-}
-
-static portMUX_TYPE listMux = portMUX_INITIALIZER_UNLOCKED;  // phones[] and pendingConn[] are shared with the BLE task
 
 static bool known(const ble_addr_t& a) {
   bool found = false;
@@ -100,125 +94,58 @@ static void addPhone(const ble_addr_t& a) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// talking to WLED over the bridge's Wi-Fi (runs in its own task, never in the BLE callbacks)
+// connections
 
-static int wledHttp(uint32_t ip, const char* method, const char* path, const char* body, String* out) {
-  WiFiClient client;
-  HTTPClient http;
-  http.setConnectTimeout(1500);
-  http.setTimeout(2500);
-  if (!http.begin(client, IPAddress(ip).toString(), 80, path)) return -1;
-  int code;
-  if (strcmp(method, "POST") == 0) {
-    http.addHeader("Content-Type", "application/json");
-    code = http.POST((uint8_t*)body, strlen(body));
-  } else {
-    code = http.GET();
-  }
-  if (out && code > 0) *out = http.getString();
-  http.end();
-  return code;
-}
-
-static bool findWled() {
-  wifi_sta_list_t wifiList;
-  esp_netif_sta_list_t ipList;
-  if (esp_wifi_ap_get_sta_list(&wifiList) != ESP_OK || esp_netif_get_sta_list(&wifiList, &ipList) != ESP_OK) return false;
-  for (int i = 0; i < ipList.num; i++) {
-    uint32_t ip = ipList.sta[i].ip.addr;
-    String info;
-    if (ip && wledHttp(ip, "GET", "/json/info", nullptr, &info) == 200 &&
-        (info.indexOf("\"brand\":\"WLED\"") >= 0 || info.indexOf("\"leds\"") >= 0)) {
-      wledIp = ip;
-      return true;
+static Link* linkFor(uint16_t handle, bool create) {  // call with listMux held
+  for (auto& l : links)
+    if (l.handle == handle) return &l;
+  if (!create) return nullptr;
+  for (auto& l : links)
+    if (l.handle == 0xFFFF) {
+      l = Link();
+      l.handle = handle;
+      l.since = millis();
+      return &l;
     }
-  }
-  return false;
+  return nullptr;
 }
 
-// Picks "on", "bri" and "lor" out of WLED's state JSON (no JSON library needed for three fields).
-static int field(const String& s, const char* key) {
-  int at = s.indexOf(key);
-  if (at < 0) return -1;
-  at += strlen(key);
-  if (s.startsWith("true", at)) return 1;
-  if (s.startsWith("false", at)) return 0;
-  return s.substring(at).toInt();
-}
-
-static void worker(void*) {
-  static Job job;
-  for (;;) {
-    if (xQueueReceive(jobs, &job, portMAX_DELAY) != pdTRUE) continue;
-    job.json[job.len < sizeof job.json ? job.len : sizeof job.json - 1] = 0;
-    String state;
-    bool ok = false;
-    const char* err = "WLED isn't connected to the bridge";
-    for (int attempt = 0; attempt < 2 && !ok; attempt++) {
-      if (!wledIp && !findWled()) continue;
-      if (job.len && wledHttp(wledIp, "POST", "/json/state", job.json, nullptr) != 200) {
-        wledIp = 0;
-        err = "WLED didn't accept the command";
-        continue;
-      }
-      ok = wledHttp(wledIp, "GET", "/json/state", nullptr, &state) == 200;
-      if (!ok) wledIp = 0;
-    }
-    char summary[200];
-    seq++;
-    if (ok)
-      snprintf(summary, sizeof summary, "{\"n\":%lu,\"ok\":1,\"on\":%s,\"bri\":%d,\"lor\":%d}", (unsigned long)seq,
-               field(state, "\"on\":") == 1 ? "true" : "false", field(state, "\"bri\":"), field(state, "\"lor\":"));
-    else
-      snprintf(summary, sizeof summary, "{\"n\":%lu,\"ok\":0,\"err\":\"%s\"}", (unsigned long)seq, err);
-    if (stateChr) stateChr->setValue((const uint8_t*)summary, strlen(summary));
-    if (job.fromPc) {
-      portENTER_CRITICAL(&mux);
-      strlcpy(pcResult, summary, sizeof pcResult);
-      pcResultReady = true;
-      portEXIT_CRITICAL(&mux);
-    }
-  }
-}
-
-static void enqueue(const char* json, size_t len, bool fromPc) {
-  Job job;  // copied into the queue; the BLE host task and the main loop can both call this
-  job.len = len < sizeof job.json ? len : sizeof job.json - 1;
-  job.fromPc = fromPc;
-  memcpy(job.json, json, job.len);
-  xQueueSend(jobs, &job, 0);
-}
-
-// ---------------------------------------------------------------------------------------------
-// BLE
-
-static void unpend(uint16_t handle) {
+static void pushState(bool notify) {
+  char buf[200];
+  size_t n = wledStateJson(buf, sizeof buf);
+  if (!n || !stateChr) return;
+  stateChr->setValue((const uint8_t*)buf, n);
+  if (!notify) return;
+  uint16_t targets[MAX_CONN];
+  int count = 0;
   portENTER_CRITICAL(&listMux);
-  for (int i = 0; i < 4; i++)
-    if (pendingConn[i] == handle) pendingConn[i] = 0xFFFF;
+  for (auto& l : links)
+    if (l.handle != 0xFFFF && l.approved && l.subscribed) targets[count++] = l.handle;
   portEXIT_CRITICAL(&listMux);
+  // notified only to approved phones (NimBLE's own notify() would reach any subscriber)
+  for (int i = 0; i < count; i++)
+    if (server->getPeerMTU(targets[i]) >= n + 3)
+      ble_gattc_notify_custom(targets[i], stateChr->getHandle(), ble_hs_mbuf_from_flat(buf, n));
 }
 
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* s, ble_gap_conn_desc* desc) override {
     portENTER_CRITICAL(&listMux);
-    for (int i = 0; i < 4; i++)
-      if (pendingConn[i] == 0xFFFF) {
-        pendingConn[i] = desc->conn_handle;
-        pendingSince[i] = millis();
-        break;
-      }
+    linkFor(desc->conn_handle, true);
     portEXIT_CRITICAL(&listMux);
     NimBLEDevice::startSecurity(desc->conn_handle);  // iOS asks for the PIN the first time
-    NimBLEDevice::startAdvertising();                // stay discoverable for a second phone
+    NimBLEDevice::startAdvertising();                // stay discoverable for another phone
   }
 
-  void onDisconnect(NimBLEServer* s, ble_gap_conn_desc* desc) override { unpend(desc->conn_handle); }
+  void onDisconnect(NimBLEServer* s, ble_gap_conn_desc* desc) override {
+    portENTER_CRITICAL(&listMux);
+    if (Link* l = linkFor(desc->conn_handle, false)) *l = Link();
+    portEXIT_CRITICAL(&listMux);
+  }
 
   uint32_t onPassKeyRequest() override { return pin; }
 
   void onAuthenticationComplete(ble_gap_conn_desc* desc) override {
-    unpend(desc->conn_handle);
     bool ok = desc->sec_state.encrypted && desc->sec_state.authenticated;
     if (ok && !known(desc->peer_id_addr)) {
       if (phonePairingLeft() > 0) {
@@ -231,23 +158,43 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     if (!ok) {
       NimBLEDevice::deleteBond(NimBLEAddress(desc->peer_id_addr));
       server->disconnect(desc->conn_handle);
+      return;
     }
+    portENTER_CRITICAL(&listMux);
+    if (Link* l = linkFor(desc->conn_handle, true)) l->approved = true;
+    portEXIT_CRITICAL(&listMux);
+    // 15-30 ms connection events (within Apple's limits) so taps reach the bridge quickly
+    server->updateConnParams(desc->conn_handle, 12, 24, 0, 400);
+    pushState(true);
   }
 };
 
 class CommandCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c, ble_gap_conn_desc* desc) override {
-    if (!desc->sec_state.authenticated || !known(desc->peer_id_addr)) return;
+    bool approved = false;
+    portENTER_CRITICAL(&listMux);
+    if (Link* l = linkFor(desc->conn_handle, false)) approved = l->approved;
+    portEXIT_CRITICAL(&listMux);
+    if (!approved || !desc->sec_state.authenticated) return;
     NimBLEAttValue v = c->getValue();
-    enqueue((const char*)v.data(), v.length(), false);
+    wledSend((const char*)v.data(), v.length());
   }
 };
+
+class StateCallbacks : public NimBLECharacteristicCallbacks {
+  void onSubscribe(NimBLECharacteristic* c, ble_gap_conn_desc* desc, uint16_t subValue) override {
+    portENTER_CRITICAL(&listMux);
+    if (Link* l = linkFor(desc->conn_handle, false)) l->subscribed = subValue & 1;
+    portEXIT_CRITICAL(&listMux);
+    if (subValue & 1) pushState(true);
+  }
+};
+
+// ---------------------------------------------------------------------------------------------
 
 void phoneBegin() {
   loadPhones();
   pinMode(BOOT_BUTTON, INPUT_PULLUP);
-  jobs = xQueueCreate(4, sizeof(Job));
-  xTaskCreatePinnedToCore(worker, "phone", 8192, nullptr, 1, nullptr, 1);
 
   NimBLEDevice::init(WL_BLE_NAME);
   NimBLEDevice::setPower(ESP_PWR_LVL_N0);  // 0 dBm: one room
@@ -260,37 +207,46 @@ void phoneBegin() {
   server->setCallbacks(new ServerCallbacks());
   NimBLEService* svc = server->createService(SVC_UUID);
   NimBLECharacteristic* cmd = svc->createCharacteristic(
-      CMD_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC | NIMBLE_PROPERTY::WRITE_AUTHEN, 512);
+      CMD_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::WRITE_ENC | NIMBLE_PROPERTY::WRITE_AUTHEN, 512);
   cmd->setCallbacks(new CommandCallbacks());
   stateChr = svc->createCharacteristic(
-      STATE_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::READ_AUTHEN, 200);
-  stateChr->setValue("{\"n\":0}");
+      STATE_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::READ_AUTHEN | NIMBLE_PROPERTY::NOTIFY, 200);
+  stateChr->setCallbacks(new StateCallbacks());
+  pushState(false);
   svc->start();
 
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   adv->addServiceUUID(SVC_UUID);
   adv->setScanResponse(true);
+  adv->setMinInterval(244);  // 152.5-211 ms: quick to find, leaves the radio to Wi-Fi most of the time
+  adv->setMaxInterval(338);
   adv->start();
 }
 
 void phoneLoop() {
-  static uint32_t pressedAt = 0;
+  static uint32_t pressedAt = 0, lastSeq = 0;
   if (digitalRead(BOOT_BUTTON) == LOW) {  // hold BOOT for 2 s to let a new phone pair
     if (!pressedAt) pressedAt = millis();
     else if (millis() - pressedAt > 2000 && phonePairingLeft() == 0) phoneOpenPairing(120);
   } else {
     pressedAt = 0;
   }
-  uint16_t kick = 0xFFFF;  // disconnect outside the lock
+
+  uint32_t seq = wledStateSeq();
+  if (seq != lastSeq) {
+    lastSeq = seq;
+    pushState(true);
+  }
+
+  uint16_t kick = 0xFFFF;  // drop connections that never paired; disconnect outside the lock
   portENTER_CRITICAL(&listMux);
-  for (int i = 0; i < 4 && kick == 0xFFFF; i++)
-    if (pendingConn[i] != 0xFFFF && millis() - pendingSince[i] > UNPAIRED_KICK_MS) {
-      kick = pendingConn[i];
-      pendingConn[i] = 0xFFFF;
-    }
+  for (auto& l : links)
+    if (l.handle != 0xFFFF && !l.approved && millis() - l.since > UNPAIRED_KICK_MS && kick == 0xFFFF) kick = l.handle;
   portEXIT_CRITICAL(&listMux);
   if (kick != 0xFFFF) server->disconnect(kick);
 }
+
+void phoneEnd() { NimBLEDevice::deinit(true); }
 
 void phoneOpenPairing(uint16_t seconds) { pairingUntil = millis() + seconds * 1000UL; }
 
@@ -323,15 +279,4 @@ int phonePairingLeft() {
   uint32_t until = pairingUntil;
   int32_t left = (int32_t)(until - millis());
   return until && left > 0 ? (left + 999) / 1000 : 0;
-}
-
-void phoneInject(const char* json, size_t len) { enqueue(json, len, true); }
-
-bool phoneTakeResult(char* out, size_t cap) {
-  if (!pcResultReady) return false;
-  portENTER_CRITICAL(&mux);
-  strlcpy(out, pcResult, cap);
-  pcResultReady = false;
-  portEXIT_CRITICAL(&mux);
-  return true;
 }

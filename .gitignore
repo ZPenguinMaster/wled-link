@@ -9,3 +9,5 @@ __pycache__/
 # local settings and anything with the Wi-Fi password baked into an image
 pc/wledlink.json
 wledlink-wifi-qr.png
+wled-src/
+wled-build.log

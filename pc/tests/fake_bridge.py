@@ -41,6 +41,11 @@ class FakeBridge:
         self.udp_sent = 0
         self.sessions = 0
         self.gaps = 0
+        self.wled_cmds = []      # H_WLED_CMD payloads received
+        self.baud_requests = []
+        self.light = {"on": 1, "bri": 128, "lor": 0, "live": 0, "ps": -1, "fx": 9, "cct": 127, "col": [255, 0, 0, 0]}
+        self.light_seq = 0
+        self.last_stream = 0.0   # like the real bridge, "live" follows the LED data it forwards
 
     async def start(self):
         self.server = await asyncio.start_server(self._on_host, "127.0.0.1", 0)
@@ -95,9 +100,10 @@ class FakeBridge:
         self._send_json(wl.B_INFO, {
             "proto": 1, "fw": "fake", "boot": f"{self.boot_id:08x}", "nonce": self.hello_nonce,
             "host": 1 if self.host_active else 0, "mac": "de:ad:be:ef:00:01", "wifi": 1, "ssid": "WLEDLink",
-            "pass": "quartz-basil-1769", "ch": 6, "chCfg": 0, "hidden": 1, "txq": 34, "withPc": 0, "apIp": "192.168.77.1",
-            "maxConns": MAX_CONNS, "win": WINDOW, "uptime": 1, "heap": 150000, "sta": len(self.stations),
-            "udpTx": self.udp_sent, "udpDrop": 0, "rxBad": 0, "rxGaps": self.gaps, "tcpOpened": 0})
+            "pass": "quartz-basil-1769", "ch": 6, "chCfg": 0, "hidden": 1, "txq": 34, "withPc": 0, "caps": "ws,baud,phone", "apIp": "192.168.77.1",
+            "maxConns": MAX_CONNS, "win": WINDOW, "uptime": 1, "heap": 150000, "minHeap": 120000, "sta": len(self.stations),
+            "udpTx": self.udp_sent, "udpDrop": 0, "rxBad": 0, "rxGaps": self.gaps, "tcpOpened": 0,
+            "phones": 1, "phonePin": "482913", "pairing": 0})
 
     def _send_sta_list(self):
         self._send_json(wl.B_STA_LIST, {"sta": self.stations})
@@ -139,6 +145,10 @@ class FakeBridge:
                 self._end_session()
             if not self.host_active:
                 self._send_info()
+            if self.light["live"] and loop.time() - self.last_stream > 2.5:
+                self.light["live"] = 0
+                if self.host_active:
+                    self._send_light()
 
     async def _on_frame(self, encoded):
         frame = wl.decode_frame(encoded)
@@ -154,6 +164,7 @@ class FakeBridge:
             self.hello_nonce = struct.unpack_from("<I", p, 1)[0]
             self._send_info()
             self._send_sta_list()
+            self._send_light()
             return
         if not self.host_active:
             self._send_info()
@@ -170,7 +181,8 @@ class FakeBridge:
         elif ftype == wl.H_STA_REQ:
             self._send_sta_list()
         elif ftype == wl.H_STATS_REQ:
-            self._send_json(wl.B_STATS, {"uptime": 5, "heap": 150000, "sta": len(self.stations), "udpTx": self.udp_sent})
+            self._send_json(wl.B_STATS, {"uptime": 5, "heap": 150000, "minHeap": 120000, "sta": len(self.stations), "udpTx": self.udp_sent,
+                                             "phones": 1, "phonePin": "482913", "pairing": 0})
         elif ftype == wl.H_SET_CONFIG:
             self.config_payloads.append(bytes(p))
             self._send_json(wl.B_CONFIG_RESULT, {"ok": True, "msg": "saved, rebooting"})
@@ -191,10 +203,51 @@ class FakeBridge:
             if conn and not conn["closing"]:
                 conn["closing"] = True
                 conn["queue"].put_nowait(None)
+        elif ftype == wl.H_WLED_CMD:
+            cmd = json.loads(p)
+            self.wled_cmds.append(cmd)
+            for key in ("on", "bri", "lor", "ps"):
+                if key in cmd:
+                    self.light[key] = int(cmd[key]) if isinstance(cmd[key], bool) else cmd[key]
+            seg = cmd.get("seg") or {}
+            if isinstance(seg, dict):
+                for key in ("fx", "cct"):
+                    if key in seg:
+                        self.light[key] = seg[key]
+                if seg.get("col"):
+                    self.light["col"] = list(seg["col"][0]) + [0] * (4 - len(seg["col"][0]))
+            self._send_light()  # like the real bridge: echo the new state at once
+            asyncio.create_task(self._apply_to_wled(p))
+        elif ftype == wl.H_SET_BAUD:
+            rate = struct.unpack("<I", p[:4])[0]
+            self.baud_requests.append(rate)
+            self._send(wl.B_BAUD, bytes([1]) + p[:4])  # a socket has no baud rate; just agree
         elif ftype == wl.H_UDP_SEND:
             if socket.inet_ntoa(p[0:4]) == self.station_ip:
                 self.udp.sendto(p[6:], self.wled_udp)
                 self.udp_sent += 1
+                self.last_stream = asyncio.get_running_loop().time()
+                if not self.light["live"]:
+                    self.light["live"] = 1
+                    self._send_light()
+
+    def _send_light(self):
+        self.light_seq += 1
+        self._send_json(wl.B_WLED_STATE, dict(self.light, n=self.light_seq, ws=1, ok=1))
+
+    async def _apply_to_wled(self, body):
+        """Forward a command to the fake WLED over HTTP (the real bridge uses a WebSocket)."""
+        crlf = bytes([13, 10])
+        head = [b"POST /json/state HTTP/1.1", b"Host: x", b"Content-Type: application/json",
+                b"Content-Length: " + str(len(body)).encode(), b"", b""]
+        try:
+            r, w = await asyncio.open_connection(*self.wled_http)
+            w.write(crlf.join(head) + bytes(body))
+            await w.drain()
+            await r.read()
+            w.close()
+        except OSError:
+            pass
 
     async def _open(self, cid, ip, port):
         if cid in self.conns:

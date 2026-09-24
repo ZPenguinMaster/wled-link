@@ -31,6 +31,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -45,14 +46,14 @@ try:
 except ImportError:  # reported in main() so --help still works
     serial = None
 
-VERSION = "1.2.0"
+VERSION = "1.4.0"
 PROTO_VERSION = 1
 
 # Message types, see bridge/src/main.cpp for the payload layouts.
 H_HELLO, H_PING, H_STA_REQ, H_SET_CONFIG, H_REBOOT, H_STATS_REQ = 0x01, 0x02, 0x03, 0x04, 0x05, 0x06
-H_PHONE_PAIR, H_PHONE_FORGET, H_PHONE_PIN, H_PHONE_TEST = 0x07, 0x08, 0x09, 0x0A
+H_PHONE_PAIR, H_PHONE_FORGET, H_PHONE_PIN, H_WLED_CMD, H_SET_BAUD = 0x07, 0x08, 0x09, 0x0B, 0x0C
 H_TCP_OPEN, H_TCP_DATA, H_TCP_CLOSE, H_UDP_SEND = 0x10, 0x11, 0x12, 0x20
-B_INFO, B_PONG, B_STA_LIST, B_CONFIG_RESULT, B_STATS, B_PHONE_RESULT = 0x81, 0x82, 0x83, 0x84, 0x86, 0x87
+B_INFO, B_PONG, B_STA_LIST, B_CONFIG_RESULT, B_STATS, B_WLED_STATE, B_BAUD = 0x81, 0x82, 0x83, 0x84, 0x86, 0x88, 0x89
 B_TCP_OPEN_RESULT, B_TCP_DATA, B_TCP_CLOSED, B_TCP_ACK = 0x90, 0x91, 0x92, 0x93
 
 OPEN_ERRORS = {
@@ -68,6 +69,7 @@ MAX_UDP_PAYLOAD = MAX_PAYLOAD - 6
 LINK_TIMEOUT = 5.0        # seconds without any frame before the bridge counts as gone
 PROBE_SECONDS = 4.0       # how long to listen on a serial port for the bridge's beacon
 DEFAULT_BAUD = 921600
+FAST_BAUD = 2_000_000  # tried once per connection; kept only if the USB chip handles it
 DEFAULT_LISTEN = "127.0.0.2"
 DEFAULT_UDP_PORTS = (21324, 4048, 5568, 6454)  # WLED realtime/sync, DDP, E1.31, Art-Net
 USB_SERIAL_IDS = {(0x10C4, 0xEA60), (0x1A86, 0x7523), (0x1A86, 0x55D4), (0x0403, 0x6001), (0x303A, 0x1001)}
@@ -83,6 +85,11 @@ IP_FIELD = re.compile(rb'"ip"\s*:\s*"[0-9.]*"')
 WHITE_TONES = {"neutral": 127, "cool": 255, "warm": 0}
 AUTO_WHITE_MODES = {0: "None", 1: "Brighter", 2: "Accurate", 3: "Dual", 4: "Max"}
 # WLED's "AP opens" setting for its own WLED-AP hotspot, by the names the CLI and status page use.
+# Hands the light to SignalRGB. "live": false ends WLED's current live session, so the stream's next
+# frame starts a new one, and WLED blanks the whole strip when a session starts. LEDs the stream doesn't
+# cover then stay dark instead of keeping the previous colour; WLED's own colour is set to black too,
+# so the strip goes dark rather than back to an old colour when SignalRGB stops.
+SYNC_STATE = {"on": True, "lor": 0, "live": False, "seg": {"fx": 0, "col": [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]}, "tt": 0}
 HOTSPOT_MODES = {"off": 3, "boot": 0, "fallback": 1}  # never / only if it boots without the bridge / whenever it loses it
 
 
@@ -98,14 +105,19 @@ def settings_summary(cfg: dict | None) -> dict:
     ap = cfg.get("ap") or {}
     return {"readable": True, "cctBlend": led.get("cb", 0), "autoWhite": auto_white,
             "autoWhiteName": AUTO_WHITE_MODES.get(auto_white, str(auto_white)),
-            "cctFromRgb": bool(led.get("cr")), "apBehavior": ap.get("behav", 0), "apHidden": bool(ap.get("hide"))}
+            "cctFromRgb": bool(led.get("cr")), "apBehavior": ap.get("behav", 0), "apHidden": bool(ap.get("hide")),
+            "transition": ((cfg.get("light") or {}).get("tr") or {}).get("dur")}
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 FIRMWARE_BIN = ROOT / "bridge" / "prebuilt" / "wledlink-bridge.bin"
+WLED_FIRMWARE_BIN = ROOT / "wled" / "prebuilt" / "WLED_16.0.1_ESP32_wledlink.bin"  # see wled/README.md
+NVS_START, NVS_END = 0x9000, 0xE000  # the bridge's settings area (bridge/platformio.ini: default.csv)
 FIRMWARE_CONFIG = ROOT / "bridge" / "src" / "config.h"
 CONFIG_FILE = HERE / "wledlink.json"
 APP_DIR = Path(os.environ.get("WLEDLINK_HOME") or Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "wledlink")
+SLOW_USB_FILE = APP_DIR / "slow-usb.json"  # {bridge MAC: when FAST_BAUD failed}, so it isn't retried at every start
+SLOW_USB_RETRY = 30 * 86400
 
 log = logging.getLogger("wledlink")
 
@@ -185,6 +197,14 @@ def open_serial(name: str, baud: int):
     return ser
 
 
+def slow_usb_bridges() -> dict:
+    """Bridges whose USB chip turned out not to handle FAST_BAUD (older CP2102), by MAC."""
+    try:
+        return json.loads(SLOW_USB_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
 def usb_serial_ports(prefer: str | None = None) -> list[str]:
     """USB serial ports, likely ESP32 boards first. Bluetooth COM ports are skipped: opening
     them can hang for many seconds."""
@@ -224,20 +244,31 @@ class PortScanner:
             names = [explicit]
         else:
             now = time.monotonic()
-            names = [n for n in usb_serial_ports(prefer) if n == prefer or now - self._failed.get(n, -1e9) > 30]
+            try:
+                ports = usb_serial_ports(prefer)
+            except Exception as exc:  # Windows' device list can fail while USB devices come and go
+                log.debug("cannot list serial ports: %s", exc)
+                return None
+            names = [n for n in ports if n == prefer or now - self._failed.get(n, -1e9) > 30]
         for name in names:
             if abort():
                 return None
             try:
                 ser = open_serial(name, baud)
-            except (OSError, serial.SerialException) as exc:
+            except Exception as exc:
                 log.debug("cannot open %s: %s", name, exc)
                 self._failed[name] = time.monotonic()
                 continue
-            if listen_for_beacon(ser, PROBE_SECONDS, abort):
+            try:
+                found = listen_for_beacon(ser, PROBE_SECONDS, abort)
+            except Exception as exc:  # e.g. the port vanished mid-probe as the PC wakes up
+                log.debug("probing %s failed: %s", name, exc)
+                found = False
+            if found:
                 self._failed.pop(name, None)
                 return ser, name
-            ser.close()
+            with contextlib.suppress(Exception):
+                ser.close()
             self._failed[name] = time.monotonic()
             log.debug("no bridge on %s", name)
         return None
@@ -347,6 +378,9 @@ class SerialLink:
                     self._loop.call_soon_threadsafe(self._deliver, frames)
         except Exception as exc:
             self.close(f"serial read error ({exc})")
+
+    def set_baudrate(self, rate: int):
+        self.ser.baudrate = rate
 
     def _deliver(self, frames):
         for ftype, seq, payload in frames:
@@ -548,10 +582,35 @@ class Bridge:
         self._last_port: str | None = None
         self._paused_until = 0.0
         self._config_waiters: list[asyncio.Future] = []
-        self._phone_waiters: list[asyncio.Future] = []
         self._udp: dict[int, asyncio.BaseTransport | None] = {}
         self._scanner = PortScanner()
         self._last_time_sync = 0.0
+        self.light: dict = {}          # the light's state, pushed by the bridge (see wled.cpp)
+        self.baud = DEFAULT_BAUD
+        self._baud_started = False
+        self._baud_waiter: asyncio.Future | None = None
+        self._fast_baud_failed = False
+        self._subscribers: set[asyncio.Event] = set()
+        self._polling_light = False
+
+    # -- live updates for the status page
+
+    def subscribe(self) -> asyncio.Event:
+        ev = asyncio.Event()
+        ev.set()
+        self._subscribers.add(ev)
+        return ev
+
+    def unsubscribe(self, ev: asyncio.Event):
+        self._subscribers.discard(ev)
+
+    def changed(self):
+        for ev in self._subscribers:
+            ev.set()
+
+    @property
+    def caps(self) -> set[str]:
+        return set(str(self.info.get("caps", "")).split(","))
 
     # -- lifecycle
 
@@ -562,22 +621,32 @@ class Bridge:
         helpers = [asyncio.create_task(self._keepalive()), asyncio.create_task(self._resolver())]
         try:
             while True:
-                if time.monotonic() < self._paused_until:
-                    self.state = "paused"
+                found = None
+                try:
+                    if time.monotonic() < self._paused_until:
+                        self.state = "paused"
+                        await asyncio.sleep(0.5)
+                        continue
+                    self.state = "searching"
+                    found = await asyncio.to_thread(self._scanner.scan, self.cfg.port, self.cfg.baud, self._last_port,
+                                                    lambda: time.monotonic() < self._paused_until)
+                    if not found:
+                        await asyncio.sleep(1)
+                        continue
+                    if time.monotonic() < self._paused_until:
+                        found[0].close()
+                        continue
+                    self._attach(*found)
+                    await self._link_lost.wait()
                     await asyncio.sleep(0.5)
-                    continue
-                self.state = "searching"
-                found = await asyncio.to_thread(self._scanner.scan, self.cfg.port, self.cfg.baud, self._last_port,
-                                                lambda: time.monotonic() < self._paused_until)
-                if not found:
+                except Exception:  # never give up on the bridge: log it and look again
+                    log.exception("Unexpected error while connecting to the bridge; trying again")
+                    if self.link:
+                        self.link.close("unexpected error")
+                    elif found:
+                        with contextlib.suppress(Exception):
+                            found[0].close()
                     await asyncio.sleep(2)
-                    continue
-                if time.monotonic() < self._paused_until:
-                    found[0].close()
-                    continue
-                self._attach(*found)
-                await self._link_lost.wait()
-                await asyncio.sleep(0.5)
         finally:
             for task in helpers:
                 task.cancel()
@@ -587,6 +656,8 @@ class Bridge:
     def _attach(self, ser, name: str):
         self._link_lost.clear()
         self.port_name = self._last_port = name
+        self.baud = DEFAULT_BAUD
+        self._baud_started = False
         self.link = SerialLink(ser, self.loop, self._on_frame, self._on_link_lost)
         self._last_rx = time.monotonic()
         self.link.start()
@@ -601,7 +672,9 @@ class Bridge:
         self.link = None
         self._reset_session("bridge disconnected")
         self.state = "searching"
+        self.light = {}
         self._link_lost.set()
+        self.changed()
 
     def pause(self, seconds: float):
         """Lets go of the serial port for a while, e.g. so the bridge can be reflashed."""
@@ -630,11 +703,10 @@ class Bridge:
         self._free = []
         for conn in conns.values():
             conn._finish(ConnectionResetError(reason))
-        for fut in self._config_waiters + self._phone_waiters:
+        for fut in self._config_waiters:
             if not fut.done():
                 fut.set_exception(LinkDown(reason))
         self._config_waiters.clear()
-        self._phone_waiters.clear()
         self._rx_expect = None
         self._slots_changed.set()
 
@@ -677,22 +749,27 @@ class Bridge:
                     self._release(cid, ConnectionRefusedError(OPEN_ERRORS.get(status, f"error {status}")))
         elif ftype == B_TCP_CLOSED:
             self._release(payload[0])
+        elif ftype == B_WLED_STATE:
+            light = json.loads(payload)
+            if light.get("ws") and not self.light.get("ws") and not self.target:
+                self.request_resolve()  # the bridge just reached WLED, so it's up: look now, not in 10 s
+            self.light = light
+            self.changed()
+        elif ftype == B_BAUD:
+            if self._baud_waiter and not self._baud_waiter.done():
+                self._baud_waiter.set_result(bool(payload[0]))
         elif ftype == B_STA_LIST:
             self._on_stations(json.loads(payload))
+            self.changed()
         elif ftype == B_STATS:
             self.bridge_stats = json.loads(payload)
+            self.changed()
         elif ftype == B_CONFIG_RESULT:
             result = json.loads(payload)
             for fut in self._config_waiters:
                 if not fut.done():
                     fut.set_result(result)
             self._config_waiters.clear()
-        elif ftype == B_PHONE_RESULT:
-            result = json.loads(payload)
-            for fut in self._phone_waiters:
-                if not fut.done():
-                    fut.set_result(result)
-            self._phone_waiters.clear()
 
     def _on_info(self, payload: bytes):
         try:
@@ -710,10 +787,15 @@ class Bridge:
                 self.window = int(info.get("win", 4096))
                 self._free = list(range(int(info.get("maxConns", 8))))
                 self._slots_changed.set()
-                log.info("Bridge ready: firmware %s, Wi-Fi \"%s\" on channel %s",
-                         info.get("fw"), info.get("ssid"), info.get("ch"))
+                log_ready = log.debug if self._baud_started else log.info  # the post-speed-up session is routine
+                log_ready("Bridge ready: firmware %s, Wi-Fi \"%s\" on channel %s", info.get("fw"), info.get("ssid"), info.get("ch"))
                 self.send(H_STA_REQ)
                 self.request_resolve()
+                if ("baud" in self.caps and not self._baud_started and not self._fast_baud_failed
+                        and time.time() - slow_usb_bridges().get(str(info.get("mac")), 0) > SLOW_USB_RETRY):
+                    self._baud_started = True
+                    asyncio.create_task(self._speed_up(self.link))
+                self.changed()
             return
         if self.state == "ready":
             log.warning("The bridge dropped the session; starting a new one")
@@ -731,6 +813,46 @@ class Bridge:
             log.info("Devices on the bridge Wi-Fi: %s", joined)
             self.request_resolve()
 
+    async def _speed_up(self, link: SerialLink):
+        """Moves the serial link to FAST_BAUD if the USB chip can do it (CP2102N and CH340 can, the older
+        CP2102 can't). The bridge only keeps the new speed if it hears a valid frame at it within 1.5 s,
+        and goes back to the default whenever the session ends, so nothing can get stuck."""
+        self._baud_waiter = asyncio.get_running_loop().create_future()
+        self.send(H_SET_BAUD, struct.pack("<I", FAST_BAUD))
+        try:
+            ok = await asyncio.wait_for(self._baud_waiter, 1.0)
+        except (asyncio.TimeoutError, LinkDown):
+            return
+        finally:
+            self._baud_waiter = None
+        if not ok or link is not self.link:
+            return
+        try:
+            link.set_baudrate(FAST_BAUD)
+            self._start_handshake()
+            deadline = time.monotonic() + 1.5
+            while time.monotonic() < deadline and link is self.link and self.state != "ready":
+                await asyncio.sleep(0.05)
+            if link is self.link and self.state == "ready":
+                self.baud = FAST_BAUD
+                log.info("Serial link sped up to %d baud", FAST_BAUD)
+                self.changed()
+                return
+        except Exception as exc:  # the driver refused the speed
+            log.debug("fast baud rate failed: %s", exc)
+        self._fast_baud_failed = True
+        log.info("The bridge's USB chip can't do %d baud; staying at %d", FAST_BAUD, DEFAULT_BAUD)
+        with contextlib.suppress(OSError):
+            known = slow_usb_bridges()
+            known[str(self.info.get("mac"))] = int(time.time())
+            SLOW_USB_FILE.write_text(json.dumps(known))
+        if link is not self.link:
+            return
+        with contextlib.suppress(Exception):
+            link.set_baudrate(DEFAULT_BAUD)
+        await asyncio.sleep(1.7)  # the bridge falls back 1.5 s after it stops hearing us
+        self._start_handshake()
+
     async def _keepalive(self):
         tick = 0
         while True:
@@ -739,13 +861,19 @@ class Bridge:
             link = self.link
             if not link:
                 continue
-            if time.monotonic() - self._last_rx > LINK_TIMEOUT:
-                link.close("the bridge stopped responding")
-            elif self.state == "handshake" and time.monotonic() - self._hello_at > 1.5:
-                self._start_handshake()
-            elif self.state == "ready":
-                # any frame keeps the session alive; the station list is also pushed on changes
-                self.send(H_STA_REQ if tick % 10 == 0 else H_STATS_REQ if tick % 5 == 0 else H_PING)
+            try:
+                if time.monotonic() - self._last_rx > LINK_TIMEOUT:
+                    link.close("the bridge stopped responding")
+                elif self.state == "handshake" and time.monotonic() - self._hello_at > 1.5:
+                    self._start_handshake()
+                elif self.state == "ready":
+                    # any frame keeps the session alive; the station list is also pushed on changes
+                    self.send(H_STA_REQ if tick % 10 == 0 else H_STATS_REQ if tick % 5 == 0 else H_PING)
+                    if (tick % 2 == 0 and self._subscribers and self.target and "ws" not in self.caps
+                            and not self._polling_light):
+                        asyncio.create_task(self._poll_light())
+            except Exception:  # a dead keepalive would drop the session every few seconds
+                log.exception("Unexpected error in the keepalive; carrying on")
 
     # -- connections
 
@@ -899,6 +1027,46 @@ class Bridge:
             self._last_time_sync = time.monotonic()
             log.debug("sent the current time to WLED")
 
+    # -- controlling the light
+
+    def send_wled(self, cmd: dict):
+        """Sends a WLED JSON state command the fastest way available: straight to the bridge, which
+        forwards it over its open WebSocket to WLED and echoes the new state back at once. Older bridge
+        firmware gets an HTTP request through the tunnel instead."""
+        self._require_target()
+        data = json.dumps(cmd, separators=(",", ":")).encode()
+        if len(data) > 500:
+            raise ValueError("command too long")
+        if "ws" in self.caps:
+            self.send(H_WLED_CMD, data)
+            return
+        self.light.update({k: (1 if v is True else 0 if v is False else v) for k, v in cmd.items() if k in ("on", "bri", "lor", "ps")})
+        self.changed()
+        asyncio.create_task(self._post_state(data))
+
+    async def _post_state(self, data: bytes):
+        with contextlib.suppress(Exception):
+            await self.http_request(self.target["ip"], "POST", "/json/state", data)
+
+    async def _poll_light(self):
+        """Light state for bridges without the WebSocket firmware, while someone is watching."""
+        self._polling_light = True
+        try:
+            status, body = await self.http_request(self.target["ip"], "GET", "/json/si", timeout=4)
+            if status == 200:
+                si = json.loads(body)
+                st, info = si.get("state", {}), si.get("info", {})
+                seg = (st.get("seg") or [{}])[0]
+                col = (seg.get("col") or [[0, 0, 0, 0]])[0]
+                self.light = {"ok": 1, "on": int(bool(st.get("on"))), "bri": st.get("bri"), "lor": st.get("lor", 0),
+                              "live": int(bool(info.get("live"))), "ps": st.get("ps", -1), "fx": seg.get("fx"),
+                              "cct": seg.get("cct"), "col": (list(col) + [0, 0, 0, 0])[:4]}
+                self.changed()
+        except Exception:
+            pass
+        finally:
+            self._polling_light = False
+
     # -- WLED settings and white light
 
     def _require_target(self) -> dict:
@@ -930,23 +1098,58 @@ class Bridge:
         led = {k: v for k, v in ((cfg.get("hw") or {}).get("led") or {}).items() if k not in ("ins", "matrix")}
         body: dict = {"hw": {"led": led}}
         if "light" in cfg:
-            body["light"] = cfg["light"]
-        for section, values in changes.items():
-            if section == "hw":
-                body["hw"]["led"].update(values.get("led", {}))
-            else:
-                body.setdefault(section, {}).update(values)
+            body["light"] = json.loads(json.dumps(cfg["light"]))
+
+        def merge(into: dict, values: dict):
+            for key, value in values.items():
+                if isinstance(value, dict) and isinstance(into.get(key), dict):
+                    merge(into[key], value)
+                else:
+                    into[key] = value
+
+        merge(body, changes)
         status, _ = await self.http_request(self._require_target()["ip"], "POST", "/json/cfg", json.dumps(body).encode())
         if status != 200:
             raise ConnectionError(f"WLED refused the settings change (HTTP {status}); is a settings PIN set?")
+        await self.wled_settings()
+        self.changed()
 
-    async def set_white(self, tone: str, brightness: int = 100) -> dict:
-        """Solid white from the strip's white LEDs only, overriding SignalRGB until "Back to SignalRGB"."""
+    async def presets(self) -> list[dict]:
+        """WLED's saved presets (id and name), cached for a minute."""
+        target = self._require_target()
+        cached = target.get("presets")
+        if cached and time.monotonic() - cached[0] < 60:
+            return cached[1]
+        status, body = await self.http_request(target["ip"], "GET", "/presets.json", timeout=8)
+        items = []
+        if status == 200:
+            for key, value in json.loads(body).items():
+                if key.isdigit() and int(key) > 0 and isinstance(value, dict) and value.get("n"):
+                    items.append({"id": int(key), "name": str(value["n"])[:40], "playlist": "playlist" in value})
+        items.sort(key=lambda p: p["id"])
+        target["presets"] = (time.monotonic(), items)
+        return items
+
+    async def set_transition(self, instant: bool) -> dict:
+        """WLED's default fade between changes (its own UI uses it too). Instant = no fade."""
+        cfg = await self.wled_settings()
+        if cfg is None:
+            raise ConnectionError("couldn't read WLED's settings (is a settings PIN set?)")
+        await self.update_wled_settings(cfg, {"light": {"tr": {"dur": 0 if instant else 7}}})
+        return {"ok": True, "notes": ["Changes now happen instantly everywhere, including WLED's own page." if instant
+                                      else "Changes fade over 0.7 s again (WLED's default)."]}
+
+    async def set_white(self, tone: str, brightness: int = 100, fresh: bool = False) -> dict:
+        """Solid white from the strip's white LEDs only, overriding SignalRGB until "Back to SignalRGB".
+        Uses the cached WLED settings so a tap isn't held up by a settings read."""
         if tone not in WHITE_TONES:
             raise ValueError(f"tone must be one of {', '.join(WHITE_TONES)}")
         target = self._require_target()
-        cfg = await self.wled_settings()
-        s = target["settings"]
+        s = target.get("settings") or {}
+        cfg = None
+        if fresh or not s.get("readable"):
+            cfg = await self.wled_settings()
+            s = target["settings"]
         lc = (target["info"].get("leds") or {}).get("lc", 7)  # capability bits: 1 RGB, 2 white, 4 CCT
         notes = []
         if not lc & 0x02:
@@ -964,19 +1167,18 @@ class Bridge:
             if s.get("cctFromRgb"):
                 notes.append("WLED's \"Calculate CCT from RGB\" is on, which overrides warm/cool. Turn it off in Config > LED Preferences.")
             if tone == "neutral" and s.get("cctBlend", 0) < 100:
+                cfg = cfg or await self.wled_settings()
                 if cfg is None:
                     notes.append("For both white channels at full, set \"CCT additive blending\" to 100% in WLED's "
                                  "Config > LED Preferences (the settings couldn't be read, maybe a settings PIN).")
                 else:
                     await self.update_wled_settings(cfg, {"hw": {"led": {"cb": 100}}})
-                    s["cctBlend"] = 100
                     notes.append("Set WLED's \"CCT additive blending\" to 100%, which is what lets warm and cool white "
                                  "both run at full. WLED's own white-temperature slider now peaks in the middle too.")
         bri = max(1, min(255, round(brightness * 255 / 100)))
-        state = {"on": True, "bri": bri, "lor": 2,
-                 "seg": {"fx": 0, "col": [col, [0, 0, 0, 0], [0, 0, 0, 0]], "cct": WHITE_TONES[tone]}}
-        status, _ = await self.http_request(target["ip"], "POST", "/json/state", json.dumps(state).encode())
-        return {"ok": status == 200, "notes": notes}
+        self.send_wled({"on": True, "bri": bri, "lor": 2, "tt": 0,
+                        "seg": {"fx": 0, "col": [col, [0, 0, 0, 0], [0, 0, 0, 0]], "cct": WHITE_TONES[tone]}})
+        return {"ok": True, "notes": notes}
 
     async def set_wled_hotspot(self, mode: str) -> dict:
         """When WLED opens its own "WLED-AP" hotspot: never, if it boots without the bridge, or whenever
@@ -1001,7 +1203,7 @@ class Bridge:
     # -- bridge settings
 
     async def phone(self, action: str, args: dict) -> dict:
-        """Bluetooth phone control on the bridge: pair / forget / pin / test."""
+        """Bluetooth phone control on the bridge: pair / forget / pin."""
         if self.state != "ready":
             raise LinkDown("the bridge is not connected")
         if "phonePin" not in self.bridge_stats:
@@ -1023,13 +1225,6 @@ class Bridge:
             self.send(H_PHONE_PIN, struct.pack("<I", int(pin)))
             result = await asyncio.wait_for(fut, 5)
             return {"ok": result.get("ok"), "notes": [result.get("msg", "")]}
-        if action == "test":
-            fut = asyncio.get_running_loop().create_future()
-            self._phone_waiters.append(fut)
-            self.send(H_PHONE_TEST, json.dumps(args.get("state", {})).encode())
-            result = await asyncio.wait_for(fut, 15)
-            return {"ok": bool(result.get("ok")), "result": result,
-                    "notes": [] if result.get("ok") else [result.get("err", "failed")]}
         raise ValueError("unknown phone action")
 
     async def set_config(self, payload: bytes) -> dict:
@@ -1059,12 +1254,15 @@ class Bridge:
                 "uptime": counters.get("uptime"),
                 "phones": counters.get("phones"), "phonePin": counters.get("phonePin"),
                 "phonePairing": counters.get("pairing"),
-                "freeHeap": counters.get("heap"), "udpSent": counters.get("udpTx"),
+                "freeHeap": counters.get("heap"), "minFreeHeap": counters.get("minHeap"), "udpSent": counters.get("udpTx"),
                 "udpFailed": counters.get("udpDrop"), "badFrames": counters.get("rxBad"),
                 "lostFrames": counters.get("rxGaps"),
             } if self.state != "searching" or info else {"state": self.state},
             "stations": self.stations,
             "wled": wled,
+            "light": self.light,
+            "caps": sorted(c for c in self.caps if c),
+            "baud": self.baud if self.link else None,
             "openConnections": len(self.conns),
             "udpListening": sorted(p for p, t in self._udp.items() if t),
             "stats": {
@@ -1183,6 +1381,26 @@ class HttpFront:
         finally:
             conn.close()
 
+    async def _events(self, writer):
+        """Server-sent events: the status (including the light's state) is pushed the moment it changes,
+        so every open page stays in sync without polling."""
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\n"
+                     b"Connection: keep-alive\r\n\r\n")
+        ev = self.bridge.subscribe()
+        last = None
+        try:
+            while True:
+                ev.clear()
+                data = json.dumps(self.bridge.status(), separators=(",", ":"))
+                writer.write(f"data: {data}\n\n".encode() if data != last else b": keepalive\n\n")
+                last = data
+                await writer.drain()
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(ev.wait(), 15)
+                await asyncio.sleep(0.01)  # coalesce bursts of changes into one update
+        finally:
+            self.bridge.unsubscribe(ev)
+
     def _refuse(self, req: Request) -> str | None:
         """Only this PC's own programs and pages may use the link. Listening on loopback keeps other
         machines out, but any website open in a browser here could still send requests to 127.0.0.2
@@ -1277,8 +1495,16 @@ class HttpFront:
             await writer.drain()
 
         if path == "/__wledlink" and req.method == "GET":
-            writer.write(http_response(200, "OK", STATUS_PAGE.encode(), "text/html; charset=utf-8"))
+            page = (HERE / "web" / "index.html").read_bytes()
+            writer.write(http_response(200, "OK", page, "text/html; charset=utf-8"))
             return await writer.drain()
+        if path == "/__wledlink/events" and req.method == "GET":
+            return await self._events(writer)
+        if path == "/__wledlink/presets" and req.method == "GET":
+            try:
+                return await reply_json(await b.presets())
+            except (LinkDown, ConnectionError, ValueError, asyncio.TimeoutError) as exc:
+                return await reply_json({"error": str(exc) or "timed out"}, 503)
         if path == "/__wledlink/status.json":
             return await reply_json(b.status())
         if path == "/__wledlink/phone" and req.method == "GET":
@@ -1313,8 +1539,14 @@ class HttpFront:
             if path == "/__wledlink/api/rescan":
                 b.request_resolve()
                 return await reply_json({"ok": True})
+            if path == "/__wledlink/api/state":
+                b.send_wled(args)
+                return await reply_json({"ok": True})
             if path == "/__wledlink/api/white":
-                return await reply_json(await b.set_white(str(args.get("tone", "neutral")), int(args.get("brightness", 100))))
+                return await reply_json(await b.set_white(str(args.get("tone", "neutral")), int(args.get("brightness", 100)),
+                                                          bool(args.get("fresh"))))
+            if path == "/__wledlink/api/wled-transition":
+                return await reply_json(await b.set_transition(bool(args.get("instant", True))))
             if path.startswith("/__wledlink/api/phone-"):
                 return await reply_json(await b.phone(path.rsplit("-", 1)[1], args))
             if path == "/__wledlink/api/wled-hotspot":
@@ -1345,159 +1577,6 @@ def config_payload(args: dict) -> bytes:
             bytes([channel, 1 if args.get("hidden") else 0, txq, 1 if args.get("wifiWithPc") else 0]))
 
 
-STATUS_PAGE = r"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WLED Link</title>
-<style>
-:root{--bg:#121212;--card:#1e1e1e;--fg:#e8e8e8;--dim:#9a9a9a;--line:#2e2e2e;--ok:#4caf50;--warn:#f0a020;--bad:#e5484d;--acc:#4a8cff}
-@media (prefers-color-scheme:light){:root{--bg:#f3f3f3;--card:#fff;--fg:#1b1b1b;--dim:#666;--line:#e3e3e3}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 "Segoe UI",system-ui,sans-serif}
-a{color:var(--acc)}
-main{max-width:760px;margin:0 auto;padding:20px 16px 40px}h1{font-size:22px;margin:0 0 4px}h2{font-size:16px;margin:0 0 10px}
-.sub{color:var(--dim);margin:0 0 18px}.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin:0 0 14px}
-.step{display:flex;gap:10px;padding:6px 0}.dot{flex:none;width:12px;height:12px;border-radius:50%;margin-top:5px;background:var(--dim)}
-.ok .dot{background:var(--ok)}.wait .dot{background:var(--warn)}.bad .dot{background:var(--bad)}.step b{display:block}
-.step span{color:var(--dim)}code{background:var(--line);padding:1px 5px;border-radius:4px;font-size:14px}
-.btns{display:flex;flex-wrap:wrap;gap:8px}button,.btn{font:inherit;border:1px solid var(--line);background:var(--bg);color:var(--fg);padding:8px 14px;border-radius:8px;cursor:pointer;text-decoration:none}
-button.primary,.btn.primary{background:var(--acc);border-color:var(--acc);color:#fff}button:disabled{opacity:.45;cursor:default}
-dl{display:grid;grid-template-columns:max-content 1fr;gap:4px 16px;margin:0}dt{color:var(--dim)}dd{margin:0;overflow-wrap:anywhere}
-#mode{margin:0 0 12px}details summary{cursor:pointer;color:var(--dim)}label{display:block;margin:8px 0 2px;color:var(--dim)}
-input,select{font:inherit;width:100%;padding:6px 8px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--fg)}
-.note{color:var(--dim);font-size:13px;margin-top:8px}
-</style></head><body><main>
-<h1>WLED Link</h1><p class="sub">WLED through the USB bridge &mdash; no campus Wi-Fi involved.</p>
-<section class="card"><h2>Setup</h2><div id="steps">Loading&hellip;</div></section>
-<section class="card"><h2>Lights</h2><p id="mode">&nbsp;</p>
-<div class="btns">
-<button data-white="neutral">Neutral white 100%</button><button data-white="cool">Cool white 100%</button>
-<button data-white="warm">Warm white 100%</button>
-</div>
-<div class="btns" style="margin-top:8px">
-<a class="btn primary" href="/">Open WLED</a><button data-act="signal">Back to SignalRGB</button><button data-act="off">Lights off</button>
-</div>
-<p class="note">Neutral runs the warm and cool white LEDs both at full, Cool and Warm run just one of them at full; the RGB LEDs stay off.
-The white buttons tell WLED to ignore SignalRGB (the same as WLED's own &ldquo;Override&rdquo; button) until you press Back to SignalRGB.</p>
-<p class="note" id="notes"></p></section>
-<section class="card"><h2>Bridge</h2><dl id="bridge"></dl>
-<details style="margin-top:12px"><summary>Change the bridge Wi-Fi</summary>
-<p class="note">WLED has to be switched to the new name/password as well, or it loses the connection. Change WLED first, then save here.</p>
-<form id="cfg"><label>Network name</label><input name="ssid" maxlength="32" required>
-<label>Password (8-63 characters)</label><input name="password" minlength="8" maxlength="63" required>
-<label>Channel</label><select name="channel"><option value="0">Automatic (least crowded of 1/6/11)</option>
-<option>1</option><option>6</option><option>11</option></select>
-<p><button class="primary" type="submit">Save and restart bridge</button> <span id="cfgmsg"></span></p></form></details></section>
-<section class="card" id="phoneCard" style="display:none"><h2>Phone (Bluetooth)</h2><dl id="phone"></dl>
-<div class="btns" style="margin-top:12px"><button id="pairBtn">Let a new phone pair (2 min)</button><button id="forgetBtn">Forget paired phones</button></div>
-<p class="note">On the iPhone, open the light page in the Bluefy browser, tap Connect, pick &ldquo;Lamp&rdquo; and type the PIN when iOS asks.
-Only phones paired while this window is open are accepted (holding the bridge's BOOT button for 2 s opens it too).</p>
-<p class="note" id="phoneNotes"></p></section>
-<section class="card"><h2>WLED</h2><dl id="wled"></dl>
-<div id="hotspotRow" style="display:none"><label for="hotspot">WLED's own backup hotspot (&ldquo;WLED-AP&rdquo;, http://4.3.2.1)</label>
-<select id="hotspot"><option value="boot">Only if WLED starts up without the bridge (WLED's default)</option>
-<option value="fallback">Whenever WLED loses the bridge (phone control even if the bridge has no power)</option>
-<option value="off">Never</option></select><p class="note" id="hotspotNotes"></p></div></section>
-</main>
-<script>
-const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-let last = null, formFilled = false;
-function step(state, title, text) {
-  return `<div class="step ${state}"><div class="dot"></div><div><b>${title}</b><span>${text}</span></div></div>`;
-}
-function dl(rows) { return rows.filter(r => r[1] !== undefined && r[1] !== null && r[1] !== "").map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join(""); }
-function render(s) {
-  last = s;
-  const b = s.bridge, w = s.wled, ready = b.state === "ready", joined = s.stations.length > 0;
-  const noIp = s.stations.filter(x => !x.ip || x.ip === "0.0.0.0");
-  let html = "";
-  if (ready) html += step("ok", "Bridge ESP32 connected", `on ${esc(b.port)}, private Wi-Fi <code>${esc(b.ssid)}</code> on channel ${esc(b.channel)}`);
-  else if (b.state === "paused") html += step("wait", "Link paused", "Released the serial port so the bridge can be flashed.");
-  else if (b.state === "handshake") html += step("wait", "Bridge found", `on ${esc(b.port)}, starting a session&hellip;`);
-  else html += step("bad", "Bridge ESP32 not found", "Plug the bridge ESP32 into this PC. All USB serial ports are being checked.");
-  if (!ready) html += step("", "WLED joins the bridge Wi-Fi", "Waiting for the bridge.");
-  else if (!joined) html += step("bad", "WLED has not joined the bridge Wi-Fi", `In WLED's Wi-Fi settings type network <code>${esc(b.ssid)}</code>${b.hidden ? " (it's hidden, so it won't appear in WLED's scan list)" : ""} with password <code>${esc(b.password)}</code>, and remove any other networks. Or run <code>python wledlink.py wled-wifi</code> with the WLED board on USB.`);
-  else if (noIp.length && !w) html += step("wait", "A device joined but has no IP address", "If you gave WLED a static IP for the campus network, clear it in WLED's Wi-Fi settings (use 0.0.0.0).");
-  else html += step("ok", "WLED joined the bridge Wi-Fi", s.stations.map(x => `${esc(x.mac)} (${esc(x.ip)}, ${esc(x.rssi)} dBm)`).join(", "));
-  if (w) html += step("ok", "WLED reachable", `<a href="/">http://${esc(s.listen)}/</a> &mdash; ${esc(w.name)}, ${esc(w.leds)} LEDs, v${esc(w.version)}`);
-  else html += step(ready && joined ? "wait" : "", "WLED reachable", "Waiting for WLED to answer.");
-  const ws = (w && w.settings) || {};
-  html += step(w ? "ok" : "", "SignalRGB", `Lighting Services &rarr; WLED &rarr; &ldquo;Discover WLED device by IP&rdquo;: <code>${esc(s.listen)}</code>, then Link. Colours go to UDP port ${esc((w && w.udpPort) || 21324)}.`);
-  if (ready && w) html += step("", "Phone (optional)", `Join the hidden Wi-Fi <code>${esc(b.ssid)}</code> (password <code>${esc(b.password)}</code>, turn auto-join off), then open <code>http://${esc(w.ip)}/</code> or the WLED app. ${b.wifiWithPc ? "The bridge's Wi-Fi is set to run only while this program does, so this won't work with the PC off." : "Works with the PC off too, as long as the bridge still gets USB power."}`);
-  $("steps").innerHTML = html;
-  const up = b.uptime != null ? `${Math.floor(b.uptime / 3600)}h ${Math.floor(b.uptime / 60) % 60}m` : null;
-  $("bridge").innerHTML = dl([["State", esc(b.state)], ["Serial port", esc(b.port)], ["Firmware", esc(b.firmware)],
-    ["Wi-Fi", b.ssid ? `<code>${esc(b.ssid)}</code> / <code>${esc(b.password)}</code>${b.hidden ? " (hidden)" : ""}` : null],
-    ["Channel", b.channel != null ? `${esc(b.channel)}${b.channelSetting ? "" : " (automatic)"}` : null],
-    ["TX power", b.txPowerDbm ? `${b.txPowerDbm} dBm` : null],
-    ["Wi-Fi on", b.ssid ? (b.wifiWithPc ? "only while this program runs" : "whenever the bridge has power") : null], ["Uptime", up],
-    ["Colour packets", s.stats.udp_forwarded != null ? `${s.stats.udp_forwarded} forwarded` +
-      (s.stats.udp_unreachable ? `, ${s.stats.udp_unreachable} arrived while WLED was unreachable` : "") +
-      (s.stats.udp_dropped || s.stats.udpQueueDrops ? `, ${(s.stats.udp_dropped || 0) + (s.stats.udpQueueDrops || 0)} dropped` : "") : null],
-    ["Link errors", `${s.stats.resyncs || 0} resyncs, ${s.stats.serialBadFrames || 0} bad frames`]]);
-  $("wled").innerHTML = w ? dl([["Name", esc(w.name)], ["Version", esc(w.version)], ["LEDs", esc(w.leds)],
-    ["Bridge-side IP", esc(w.ip)], ["MAC", esc(w.mac)], ["Signal", w.signal != null ? `${esc(w.signal)}%` : null],
-    ["White channel", ws.readable ? `auto-calculate: ${esc(ws.autoWhiteName)}, CCT additive blending ${esc(ws.cctBlend)}%` : null]])
-    : "<dd>Not connected.</dd>";
-  document.querySelectorAll("[data-act],[data-white]").forEach(el => el.disabled = !w);
-  $("phoneCard").style.display = ready && b.phonePin ? "block" : "none";
-  if (b.phonePin) $("phone").innerHTML = dl([["Bluetooth name", "Lamp"], ["PIN", `<code>${esc(b.phonePin)}</code>`],
-    ["Paired phones", esc(b.phones)], ["New pairing", b.phonePairing ? `open for ${esc(b.phonePairing)} s` : "closed"]]);
-  $("hotspotRow").style.display = ws.readable ? "block" : "none";
-  if (ws.readable && document.activeElement !== $("hotspot"))
-    $("hotspot").value = {3: "off", 0: "boot", 1: "fallback"}[ws.apBehavior] || "boot";
-  if (ready && !formFilled) {
-    const f = $("cfg"); f.ssid.value = b.ssid || ""; f.password.value = b.password || ""; f.channel.value = String(b.channelSetting || 0); formFilled = true;
-  }
-}
-async function refresh() {
-  try { render(await (await fetch("/__wledlink/status.json", {cache: "no-store"})).json()); }
-  catch (e) { $("steps").innerHTML = step("bad", "wledlink is not running", "Start it with <code>python wledlink.py</code>."); }
-  if (last && last.wled) {
-    try {
-      const si = await (await fetch("/json/si", {cache: "no-store"})).json();
-      const s = si.state, i = si.info;
-      let m = !s.on ? "Off" : s.lor ? "WLED override (SignalRGB is being ignored)" : i.live ? "SignalRGB is streaming" : "WLED effects / presets";
-      $("mode").textContent = `Now: ${m}` + (s.on ? `, brightness ${Math.round(s.bri / 2.55)}%` : "");
-    } catch (e) {}
-  } else $("mode").textContent = " ";
-}
-const actions = {off: {on: false}, signal: {lor: 0, on: true}};
-async function api(path, body, where = "notes") {
-  $(where).textContent = "";
-  try {
-    const r = await (await fetch(path, {method: "POST", body: JSON.stringify(body)})).json();
-    $(where).textContent = (r.notes || []).join(" ") || (r.ok === false ? `Didn't work: ${r.msg || "unknown error"}` : "");
-  } catch (e) { $(where).textContent = "wledlink didn't answer."; }
-  refresh();
-}
-$("pairBtn").addEventListener("click", () => api("/__wledlink/api/phone-pair", {seconds: 120}, "phoneNotes"));
-$("forgetBtn").addEventListener("click", () => {
-  if (confirm("Forget every paired phone?")) api("/__wledlink/api/phone-forget", {}, "phoneNotes");
-});
-$("hotspot").addEventListener("change", (ev) => {
-  api("/__wledlink/api/wled-hotspot", {mode: ev.target.value}, "hotspotNotes");
-  ev.target.blur();
-});
-document.querySelectorAll("[data-white]").forEach(el => el.addEventListener("click", () =>
-  api("/__wledlink/api/white", {tone: el.dataset.white, brightness: 100})));
-document.querySelectorAll("[data-act]").forEach(el => el.addEventListener("click", async () => {
-  $("notes").textContent = "";
-  await fetch("/json/state", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(actions[el.dataset.act])});
-  refresh();
-}));
-$("cfg").addEventListener("submit", async (ev) => {
-  ev.preventDefault();
-  const f = ev.target, b = (last && last.bridge) || {};
-  const body = {ssid: f.ssid.value, password: f.password.value, channel: +f.channel.value, hidden: !!b.hidden,
-                txPowerDbm: b.txPowerDbm || 8.5, wifiWithPc: !!b.wifiWithPc};
-  const r = await (await fetch("/__wledlink/api/bridge-config", {method: "POST", body: JSON.stringify(body)})).json();
-  $("cfgmsg").textContent = r.msg || (r.ok ? "Saved" : "Failed"); formFilled = false;
-});
-refresh(); setInterval(refresh, 2500);
-</script></body></html>
-"""
-
-
 # ---------------------------------------------------------------------------------------
 # commands
 
@@ -1510,6 +1589,10 @@ def setup_logging(verbose: bool):
         handlers.append(logging.StreamHandler())
     logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO,
                         format="%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S", handlers=handlers)
+    # Under pythonw a traceback would otherwise go nowhere, and the link would just silently stop.
+    sys.excepthook = lambda *exc: log.critical("Unexpected error", exc_info=exc)
+    threading.excepthook = lambda a: log.error("Unexpected error in thread %s", a.thread and a.thread.name,
+                                               exc_info=(a.exc_type, a.exc_value, a.exc_traceback))
 
 
 async def run_daemon(cfg: Config) -> int:
@@ -1518,7 +1601,9 @@ async def run_daemon(cfg: Config) -> int:
     try:
         await front.start()
     except OSError as exc:
-        log.error("Cannot listen on %s:%d (%s). Is wledlink already running?", cfg.listen, cfg.http_port, exc)
+        if await asyncio.to_thread(daemon_running, cfg):  # lost a race with another copy starting up
+            return 0
+        log.error("Cannot listen on %s:%d (%s). Is another program using it?", cfg.listen, cfg.http_port, exc)
         return 1
     where = cfg.listen if cfg.http_port == 80 else f"{cfg.listen}:{cfg.http_port}"
     log.info("WLED Link %s: WLED will be at http://%s/ (status page: http://%s/__wledlink)", VERSION, where, where)
@@ -1620,18 +1705,7 @@ def cmd_bridge_config(cfg: Config, args) -> int:
 
 
 def cmd_light(cfg: Config, state: dict) -> int:
-    req = urllib.request.Request(daemon_url(cfg, "/json/state"), data=json.dumps(state).encode(),
-                                 headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            resp.read()
-    except urllib.error.HTTPError as exc:
-        print(f"WLED is not reachable: {json.loads(exc.read() or b'{}').get('error', exc)}")
-        return 1
-    except OSError as exc:
-        print(f"wledlink is not running ({exc}). Start it with: python wledlink.py")
-        return 1
-    return 0
+    return cmd_api(cfg, "/__wledlink/api/state", state)
 
 
 def cmd_api(cfg: Config, path: str, body: dict) -> int:
@@ -1642,8 +1716,6 @@ def cmd_api(cfg: Config, path: str, body: dict) -> int:
         return 1
     for note in result.get("notes", []):
         print(note)
-    if "result" in result:
-        print(json.dumps(result["result"]))
     if not result.get("ok"):
         print(f"Didn't work: {result.get('msg') or result.get('error') or result}")
         return 1
@@ -1758,6 +1830,68 @@ def cmd_wled_wifi(cfg: Config, args) -> int:
             ser.close()
 
 
+def cmd_wled_update(cfg: Config, args) -> int:
+    """Installs WLED firmware on the light through the link, with WLED's own update page, and gives the
+    light back the look it had (a restart would otherwise leave it on its power-on defaults)."""
+    path = Path(args.file) if args.file else WLED_FIRMWARE_BIN
+    if not path.exists():
+        print(f"No firmware file at {path}.")
+        return 1
+    base = daemon_url(cfg, "")
+
+    def get_json(url):
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            return json.loads(resp.read())
+
+    try:
+        info, state = get_json(base + "/json/info"), get_json(base + "/json/state")
+    except (OSError, ValueError):
+        print("WLED isn't reachable through the link right now (is wledlink running?).")
+        return 1
+    image = path.read_bytes()
+    print(f"Updating WLED {info.get('ver')} ({info.get('release')}) with {path.name} ({len(image) // 1024} KB).")
+    print("Uploading through the bridge takes about half a minute...")
+    boundary = secrets.token_hex(12)
+    crlf = "\r\n"
+    body = (f"--{boundary}{crlf}Content-Disposition: form-data; name=\"update\"; filename=\"{path.name}\"{crlf}"
+            f"Content-Type: application/octet-stream{crlf}{crlf}").encode() + image + f"{crlf}--{boundary}--{crlf}".encode()
+    req = urllib.request.Request(base + "/update", data=body,
+                                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            reply = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        reply = exc.read().decode("utf-8", "replace")
+    except OSError as exc:
+        print(f"The upload failed ({exc}). WLED keeps its current firmware.")
+        return 1
+    if "successful" not in reply.lower():
+        text = re.sub(r"<[^>]+>|\s+", " ", reply).strip()
+        print(f"WLED refused the update: {text[:300]}")
+        return 1
+    print("Uploaded. WLED is restarting with the new firmware...")
+    deadline = time.monotonic() + 90
+    time.sleep(3)
+    while True:
+        try:
+            new = get_json(base + "/json/info")
+            if new.get("uptime", 1e9) < 300:
+                break
+        except (OSError, ValueError):
+            pass
+        if time.monotonic() > deadline:
+            print("WLED hasn't come back yet. It may still be starting; check the control page in a minute.")
+            return 1
+        time.sleep(1)
+    look = {k: state[k] for k in ("on", "bri", "lor") if k in state}
+    look.update(seg=state.get("seg", []), tt=0)
+    with contextlib.suppress(OSError, ValueError):
+        urllib.request.urlopen(urllib.request.Request(base + "/json/state", data=json.dumps(look).encode(),
+                                                      headers={"Content-Type": "application/json"}), timeout=10).read()
+    print(f"Done: WLED {new.get('ver')} ({new.get('release')}) is back, with the same look as before.")
+    return 0
+
+
 def cmd_flash_bridge(cfg: Config, args) -> int:
     if importlib.util.find_spec("esptool") is None:
         print("esptool is needed for flashing. Install it with:  python -m pip install esptool")
@@ -1775,10 +1909,21 @@ def cmd_flash_bridge(cfg: Config, args) -> int:
             return 1
         from importlib.metadata import version as package_version
         write = "write-flash" if int(package_version("esptool").split(".")[0]) >= 5 else "write_flash"
-        cmd = [sys.executable, "-m", "esptool", "--chip", "esp32", "--port", port, "--baud", "460800",
-               write, "0x0", str(FIRMWARE_BIN)]
-        print(" ".join(cmd))
-        return subprocess.call(cmd)
+        cmd = [sys.executable, "-m", "esptool", "--chip", "esp32", "--port", port, "--baud", "460800", write]
+        with tempfile.TemporaryDirectory() as tmp:
+            if args.reset_settings:
+                cmd += ["0x0", str(FIRMWARE_BIN)]
+            else:
+                # The image covers the whole start of the flash, settings area included. Leave that
+                # area (NVS, 0x9000-0xdfff) alone, so an update keeps the Wi-Fi settings, the
+                # Bluetooth PIN and the paired phones.
+                image = FIRMWARE_BIN.read_bytes()
+                for start, end in ((0x1000, NVS_START), (NVS_END, len(image))):
+                    part = Path(tmp, f"{start:05x}.bin")
+                    part.write_bytes(image[start:end])
+                    cmd += [hex(start), str(part)]
+            print(" ".join(cmd))
+            return subprocess.call(cmd)
 
 
 def load_config(args) -> Config:
@@ -1834,8 +1979,8 @@ def main(argv=None) -> int:
     sub.add_parser("signalrgb", help="hand the lights back to SignalRGB")
     sub.add_parser("off", help="turn the lights off")
     phone = sub.add_parser("phone", help="Bluetooth phone control: pair a phone, forget phones, change the PIN")
-    phone.add_argument("action", choices=["pair", "forget", "pin", "test"])
-    phone.add_argument("value", nargs="?", help="pin: the new 6-digit PIN; test: WLED JSON, e.g. '{\"on\":true}'")
+    phone.add_argument("action", choices=["pair", "forget", "pin"])
+    phone.add_argument("value", nargs="?", help="pin: the new 6-digit PIN")
     hotspot = sub.add_parser("wled-hotspot", help="when WLED opens its own WLED-AP hotspot")
     hotspot.add_argument("mode", choices=list(HOTSPOT_MODES),
                          help="off = never; boot = only if it starts without the bridge (WLED default); "
@@ -1846,9 +1991,14 @@ def main(argv=None) -> int:
     wifi.add_argument("--ssid")
     wifi.add_argument("--password")
 
+    upd = sub.add_parser("wled-update", help="install WLED firmware on the light through the link (default: the WLED Link build)")
+    upd.add_argument("file", nargs="?", help=f"firmware .bin (default: {WLED_FIRMWARE_BIN.relative_to(ROOT)})")
+
     flash = sub.add_parser("flash-bridge", help="flash the bridge firmware onto a spare ESP32")
     flash.add_argument("--port", help="the spare board's serial port")
     flash.add_argument("--force", action="store_true", help="flash even if the board is running WLED")
+    flash.add_argument("--reset-settings", action="store_true",
+                       help="also wipe the bridge's settings, Bluetooth PIN and paired phones")
 
     args = parser.parse_args(argv)
     if serial is None:
@@ -1858,16 +2008,24 @@ def main(argv=None) -> int:
     command = args.command or "run"
 
     if command == "run":
-        setup_logging(cfg.verbose)
-        try:
-            return asyncio.run(run_daemon(cfg))
-        except KeyboardInterrupt:
+        if daemon_running(cfg):  # e.g. started again by the autostart watchdog: nothing to do
+            print(f"WLED Link is already running: {daemon_url(cfg, '/__wledlink')}")
             return 0
+        setup_logging(cfg.verbose)
+        while True:
+            try:
+                return asyncio.run(run_daemon(cfg))
+            except KeyboardInterrupt:
+                return 0
+            except Exception:  # last line of defence: start over rather than leave the lights unreachable
+                log.exception("WLED Link stopped unexpectedly; restarting in 5 s")
+                time.sleep(5)
     if command == "status":
         return cmd_status(cfg)
     if command == "stop":
         if (rc := cmd_api(cfg, "/__wledlink/api/quit", {})) == 0:
-            print("wledlink stopped. Start it again with: python wledlink.py")
+            print("wledlink stopped. Start it again with: python wledlink.py"
+                  " (with autostart installed, its watchdog does that within a minute)")
         return rc
     if command == "ports":
         return cmd_ports()
@@ -1879,17 +2037,17 @@ def main(argv=None) -> int:
         body = {"seconds": 120}
         if args.action == "pin":
             body = {"pin": args.value or ""}
-        elif args.action == "test":
-            body = {"state": json.loads(args.value or "{}")}
         return cmd_api(cfg, f"/__wledlink/api/phone-{args.action}", body)
     if command == "wled-hotspot":
         return cmd_api(cfg, "/__wledlink/api/wled-hotspot", {"mode": args.mode})
     if command == "signalrgb":
-        return cmd_light(cfg, {"lor": 0, "on": True})
+        return cmd_light(cfg, SYNC_STATE)
     if command == "off":
-        return cmd_light(cfg, {"on": False})
+        return cmd_light(cfg, {"on": False, "tt": 0})
     if command == "wled-wifi":
         return cmd_wled_wifi(cfg, args)
+    if command == "wled-update":
+        return cmd_wled_update(cfg, args)
     if command == "flash-bridge":
         return cmd_flash_bridge(cfg, args)
     parser.print_help()

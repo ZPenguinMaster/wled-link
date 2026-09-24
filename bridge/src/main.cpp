@@ -23,8 +23,9 @@
 #include <lwip/sockets.h>
 #include "config.h"
 #include "phone.h"
+#include "wled.h"
 
-#define FW_VERSION "1.3.0"
+#define FW_VERSION "1.4.0"
 static const uint8_t PROTO_VERSION = 1;
 
 enum MsgType : uint8_t {
@@ -38,7 +39,8 @@ enum MsgType : uint8_t {
   H_PHONE_PAIR = 0x07,      // seconds(2 LE): let a new phone pair over Bluetooth
   H_PHONE_FORGET = 0x08,    // forget all paired phones
   H_PHONE_PIN = 0x09,       // pin(4 LE), answered with CONFIG_RESULT
-  H_PHONE_TEST = 0x0A,      // JSON: run it as if a paired phone sent it, answered with PHONE_RESULT
+  H_WLED_CMD = 0x0B,        // JSON WLED state command, sent on to WLED over the bridge's WebSocket
+  H_SET_BAUD = 0x0C,        // rate(4 LE): answered with BAUD, then the bridge switches speed
   H_TCP_OPEN = 0x10,        // conn(1) ip(4) port(2 BE)
   H_TCP_DATA = 0x11,        // conn(1) data
   H_TCP_CLOSE = 0x12,       // conn(1): flush what is pending, then close
@@ -49,7 +51,8 @@ enum MsgType : uint8_t {
   B_STA_LIST = 0x83,        // JSON
   B_CONFIG_RESULT = 0x84,   // JSON
   B_STATS = 0x86,           // JSON
-  B_PHONE_RESULT = 0x87,    // JSON
+  B_WLED_STATE = 0x88,      // JSON: the light's state, sent whenever it changes
+  B_BAUD = 0x89,            // ok(1) rate(4 LE)
   B_TCP_OPEN_RESULT = 0x90, // conn(1) status(1)
   B_TCP_DATA = 0x91,        // conn(1) data
   B_TCP_CLOSED = 0x92,      // conn(1) reason(1); only after this may the host reuse the slot
@@ -62,7 +65,7 @@ enum CloseReason : uint8_t { CLOSE_PEER = 0, CLOSE_ERROR = 1, CLOSE_HOST = 2, CL
 static const size_t MAX_PAYLOAD = 1600;
 static const size_t MAX_FRAME = MAX_PAYLOAD + 4;                   // type + seq + payload + crc
 static const size_t MAX_ENCODED = MAX_FRAME + MAX_FRAME / 254 + 2;
-static const int MAX_CONNS = 8;
+static const int MAX_CONNS = 6;            // browsers use at most 6 per site; each can hold ~6 KB of lwIP buffers
 static const size_t CONN_WINDOW = 4096;    // unacknowledged host->WLED bytes allowed per connection
 static const size_t TCP_CHUNK = 1024;      // max WLED->host bytes per frame
 static const uint32_t HOST_TIMEOUT_MS = 3000;
@@ -237,6 +240,16 @@ static uint8_t sockBuf[TCP_CHUNK];
 
 static void apStart();  // Wi-Fi section below
 
+static uint32_t serialBaud = WL_SERIAL_BAUD;
+static uint32_t baudTrialUntil = 0;  // a new speed is kept only if the host is heard at it by then
+static bool stateDirty = true;       // send the light's state to the host
+
+static void setBaud(uint32_t rate) {
+  Serial.flush();
+  Serial.updateBaudRate(rate);
+  serialBaud = rate;
+}
+
 // ---------------------------------------------------------------------------------------------
 // messages to the host
 
@@ -253,9 +266,10 @@ static size_t jsonEscape(char* out, size_t cap, const char* s) {
 // Counters shared by INFO and STATS (no braces, so it can be spliced into either object).
 static int formatStats(char* out, size_t cap) {
   return snprintf(out, cap,
-      "\"uptime\":%lu,\"heap\":%lu,\"sta\":%d,\"udpTx\":%lu,\"udpDrop\":%lu,\"rxBad\":%lu,\"rxGaps\":%lu,"
+      "\"uptime\":%lu,\"heap\":%lu,\"minHeap\":%lu,\"sta\":%d,\"udpTx\":%lu,\"udpDrop\":%lu,\"rxBad\":%lu,\"rxGaps\":%lu,"
       "\"tcpOpened\":%lu,\"phones\":%d,\"phonePin\":\"%06lu\",\"pairing\":%d",
-      (unsigned long)(millis() / 1000), (unsigned long)ESP.getFreeHeap(), staCount, (unsigned long)stats.udpTx,
+      (unsigned long)(millis() / 1000), (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMinFreeHeap(),
+      staCount, (unsigned long)stats.udpTx,
       (unsigned long)stats.udpDrop, (unsigned long)stats.rxBad, (unsigned long)stats.rxGaps,
       (unsigned long)stats.tcpOpened, phoneCount(), (unsigned long)phonePin(), phonePairingLeft());
 }
@@ -270,7 +284,7 @@ static void sendInfo() {
   int n = snprintf(buf, sizeof buf,
       "{\"proto\":%u,\"fw\":\"%s\",\"boot\":\"%08lx\",\"nonce\":%lu,\"host\":%d,"
       "\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"wifi\":%d,\"ssid\":\"%s\",\"pass\":\"%s\","
-      "\"ch\":%u,\"chCfg\":%u,\"hidden\":%u,\"txq\":%u,\"withPc\":%u,\"apIp\":\"%s\",\"maxConns\":%d,\"win\":%u,%s}",
+      "\"ch\":%u,\"chCfg\":%u,\"hidden\":%u,\"txq\":%u,\"withPc\":%u,\"caps\":\"ws,baud,phone\",\"apIp\":\"%s\",\"maxConns\":%d,\"win\":%u,%s}",
       PROTO_VERSION, FW_VERSION, (unsigned long)bootId, (unsigned long)helloNonce, hostActive ? 1 : 0,
       mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], apOn ? 1 : 0, ssid, pass,
       apChannel, settings.channel, settings.hidden, settings.txq, settings.withPc, IPAddress(WL_AP_IP).toString().c_str(),
@@ -437,6 +451,7 @@ static void handleUdpSend(const uint8_t* p, size_t n) {
   else
     stats.udpTx++;
   lastActivityMs = millis();
+  if (n > 6 && !(ntohs(addr.sin_port) == 21324 && p[6] == 0)) wledNoteStream();  // LED data, not a WLED sync packet
 }
 
 // Moves data between the sockets and the serial link. Returns true if anything happened.
@@ -526,6 +541,7 @@ static void endSession() {
   helloNonce = 0;
   rxExpectSeq = -1;
   closeAllConns();
+  if (serialBaud != WL_SERIAL_BAUD) setBaud(WL_SERIAL_BAUD);  // beacons always go out at the default speed
 }
 
 static void handleSetConfig(const uint8_t* p, size_t n) {
@@ -571,6 +587,7 @@ static void handleHello(uint8_t seq, const uint8_t* p, size_t n) {
   helloNonce = n >= 5 ? ((uint32_t)p[1] | (uint32_t)p[2] << 8 | (uint32_t)p[3] << 16 | (uint32_t)p[4] << 24) : 0;
   sendInfo();
   staDirty = true;
+  stateDirty = true;
 }
 
 static void handleFrame(const uint8_t* enc, size_t encLen) {
@@ -588,6 +605,7 @@ static void handleFrame(const uint8_t* enc, size_t encLen) {
   const uint8_t* p = rxFrame + 2;
   size_t len = n - 4;
   lastHostRxMs = millis();
+  baudTrialUntil = 0;  // a good frame: the current speed works
 
   if (type == H_HELLO) return handleHello(seq, p, len);
   if (!hostActive) {
@@ -617,7 +635,18 @@ static void handleFrame(const uint8_t* enc, size_t encLen) {
       sendConfigResult(ok, ok ? "PIN changed; pair your phone again" : "PIN must be 6 digits (not 123456)");
       break;
     }
-    case H_PHONE_TEST: phoneInject((const char*)p, len); break;
+    case H_WLED_CMD: wledSend((const char*)p, len); break;
+    case H_SET_BAUD: {
+      uint32_t rate = len >= 4 ? ((uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24) : 0;
+      bool ok = rate == 921600 || rate == 1000000 || rate == 1500000 || rate == 2000000 || rate == 3000000;
+      uint8_t reply[5] = {(uint8_t)ok, p[0], p[1], p[2], p[3]};
+      sendFrame(B_BAUD, reply, len >= 4 ? 5 : 1);
+      if (ok && rate != serialBaud) {
+        setBaud(rate);
+        baudTrialUntil = millis() + 1500;
+      }
+      break;
+    }
     case H_TCP_OPEN: handleTcpOpen(p, len); break;
     case H_TCP_DATA: handleTcpData(p, len); break;
     case H_TCP_CLOSE: handleTcpClose(p, len); break;
@@ -670,7 +699,7 @@ static uint8_t pickChannel() {
   WiFi.mode(WIFI_STA);
   setCountry();
   WiFi.disconnect();
-  int found = WiFi.scanNetworks(false, true, false, 150);
+  int found = WiFi.scanNetworks(false, true, false, 100);  // active scan, 100 ms a channel: ~1.1 s
   const uint8_t candidates[3] = {1, 6, 11};
   uint32_t score[3] = {0, 0, 0};
   for (int i = 0; i < found; i++) {
@@ -689,13 +718,31 @@ static uint8_t pickChannel() {
   return candidates[best];
 }
 
+// The auto-picked channel, kept across restarts (not power-ups). WLED tries to rejoin once right after
+// it loses the bridge and then only every 18 s, so after a restart the Wi-Fi has to be back before that
+// first try: reusing the channel skips the ~1 s scan.
+RTC_NOINIT_ATTR static uint32_t rtcChannelMagic;
+RTC_NOINIT_ATTR static uint8_t rtcChannel;
+static const uint32_t RTC_CHANNEL_MAGIC = 0x574c4348;
+
 static void setupWifi() {
   WiFi.persistent(false);
-  apChannel = settings.channel ? settings.channel : pickChannel();
+  if (settings.channel) {
+    apChannel = settings.channel;
+  } else if (rtcChannelMagic == RTC_CHANNEL_MAGIC && rtcChannel >= 1 && rtcChannel <= 11 &&
+             esp_reset_reason() != ESP_RST_POWERON) {
+    apChannel = rtcChannel;
+  } else {
+    apChannel = pickChannel();
+    rtcChannel = apChannel;
+    rtcChannelMagic = RTC_CHANNEL_MAGIC;
+  }
   WiFi.mode(WIFI_OFF);  // nothing on the air until the PC program connects
-  WiFi.onEvent([](arduino_event_id_t, arduino_event_info_t) { staDirty = true; }, ARDUINO_EVENT_WIFI_AP_STACONNECTED);
-  WiFi.onEvent([](arduino_event_id_t, arduino_event_info_t) { staDirty = true; }, ARDUINO_EVENT_WIFI_AP_STADISCONNECTED);
-  WiFi.onEvent([](arduino_event_id_t, arduino_event_info_t) { staDirty = true; }, ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED);
+  // a device coming or going may be WLED restarting, which would leave the bridge's WebSocket dead
+  auto onStation = [](arduino_event_id_t, arduino_event_info_t) { staDirty = true; wledCheckLink(); };
+  WiFi.onEvent(onStation, ARDUINO_EVENT_WIFI_AP_STACONNECTED);
+  WiFi.onEvent(onStation, ARDUINO_EVENT_WIFI_AP_STADISCONNECTED);
+  WiFi.onEvent(onStation, ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED);
 }
 
 // By default the access point runs whenever the bridge has power, so a phone can join it and reach
@@ -725,6 +772,18 @@ static void apStop() {
 
 // ---------------------------------------------------------------------------------------------
 
+// Restarts cleanly. Left to esp_restart(), taking Bluetooth and Wi-Fi down while colour data is flowing
+// can hang until the 5 s watchdog fires; stopped here in order it takes a few milliseconds.
+static void restartNow() {
+  Serial.flush();
+  if (udpSock >= 0) lwip_close(udpSock);
+  udpSock = -1;
+  closeAllConns();
+  phoneEnd();
+  WiFi.mode(WIFI_OFF);
+  ESP.restart();
+}
+
 static void updateLed() {
   if (WL_STATUS_LED_PIN < 0) return;
   uint32_t t = millis();
@@ -750,8 +809,10 @@ void setup() {
     conns[i].pending = (uint8_t*)malloc(CONN_WINDOW);
   }
   loadSettings();
+  sendInfo();  // tells a connected PC straight away that the bridge restarted, rather than after its timeout
   setupWifi();
   if (!settings.withPc) apStart();
+  wledBegin();
   phoneBegin();
 
   udpSock = lwip_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -775,13 +836,21 @@ void loop() {
     staCount = WiFi.softAPgetStationNum();
     staCountAtMs = now;
   }
-  if (rebootAtMs && (int32_t)(now - rebootAtMs) >= 0) {
-    Serial.flush();
-    ESP.restart();
-  }
+  if (rebootAtMs && (int32_t)(now - rebootAtMs) >= 0) restartNow();
   phoneLoop();
-  char phoneResult[200];
-  if (hostActive && phoneTakeResult(phoneResult, sizeof phoneResult)) sendFrame(B_PHONE_RESULT, phoneResult, strlen(phoneResult));
+  if (baudTrialUntil && (int32_t)(now - baudTrialUntil) > 0) {  // the host never got through at the new speed
+    baudTrialUntil = 0;
+    setBaud(WL_SERIAL_BAUD);
+    endSession();
+  }
+  static uint32_t sentStateSeq = 0;
+  if (hostActive && (stateDirty || wledStateSeq() != sentStateSeq) && Serial.availableForWrite() > 300) {
+    stateDirty = false;
+    sentStateSeq = wledStateSeq();
+    char buf[200];
+    size_t n = wledStateJson(buf, sizeof buf);
+    if (n) sendFrame(B_WLED_STATE, buf, n);
+  }
   updateLed();
   if (!busy) delay(1);
 }

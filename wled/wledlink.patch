@@ -1,0 +1,30 @@
+diff --git a/wled00/wled.cpp b/wled00/wled.cpp
+index 308c939..73efe12 100644
+--- a/wled00/wled.cpp
++++ b/wled00/wled.cpp
+@@ -944,7 +944,11 @@ void WLED::handleConnection()
+       sendImprovStateResponse(0x03, true);
+       improvActive = 2;
+     }
+-    if (now - lastReconnectAttempt > ((stac) ? 300000 : 18000) && wifiConfigured) {
++    // WLED Link: once connected, a lost network usually means the bridge ESP32 restarted or the PC it is
++    // plugged into woke up. Look for it every 5 s instead of every 18 s so the lights are back within seconds.
++    // Not when the AP should open on a lost connection (it needs 12 s without a try) or has clients.
++    const unsigned long retryMs = stac ? 300000 : (wasConnected && apBehavior != AP_BEHAVIOR_NO_CONN) ? 5000 : 18000;
++    if (now - lastReconnectAttempt > retryMs && wifiConfigured) {
+       if (improvActive == 2) improvActive = 3;
+       DEBUG_PRINTF_P(PSTR("Last reconnect (%lus) too old (@ %lus).\n"), lastReconnectAttempt/1000, nowS);
+       if (++selectedWiFi >= multiWiFi.size()) selectedWiFi = 0; // we couldn't connect, try with another network from the list
+diff --git a/wled00/wled.h b/wled00/wled.h
+index 7f264a2..a95f1a5 100644
+--- a/wled00/wled.h
++++ b/wled00/wled.h
+@@ -7,7 +7,7 @@
+  */
+ 
+ // version code in format yymmddb (b = daily build)
+-#define VERSION 2605010
++#define VERSION 2606301  // WLED Link build of 16.0.1 (official release: 2606300)
+ 
+ //uncomment this if you have a "my_config.h" file you'd like to use
+ //#define WLED_USE_MY_CONFIG
