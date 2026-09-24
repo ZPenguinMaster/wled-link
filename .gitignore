@@ -1,0 +1,11 @@
+# build output (PlatformIO), except the ready-to-flash image
+bridge/.pio/
+bridge/.vscode/
+
+# Python
+__pycache__/
+*.pyc
+
+# local settings and anything with the Wi-Fi password baked into an image
+pc/wledlink.json
+wledlink-wifi-qr.png

@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#111111">
+<title>Lights</title>
+<style>
+  :root { --bg:#111; --card:#1d1d1d; --fg:#eee; --dim:#999; --line:#2e2e2e; --acc:#4a8cff; --ok:#4caf50; --bad:#e5484d; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.4 -apple-system, "Segoe UI", system-ui, sans-serif; }
+  main { max-width: 480px; margin: 0 auto; padding: max(16px, env(safe-area-inset-top)) 16px 32px; }
+  h1 { font-size: 22px; margin: 4px 0 2px; }
+  #status { color: var(--dim); margin: 0 0 16px; min-height: 1.4em; }
+  #status.ok { color: var(--ok); } #status.bad { color: var(--bad); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  button { font: inherit; font-weight: 600; min-height: 64px; border-radius: 14px; border: 1px solid var(--line);
+           background: var(--card); color: var(--fg); padding: 10px; }
+  button:disabled { opacity: .35; }
+  button.wide { grid-column: 1 / -1; }
+  button.primary { background: var(--acc); border-color: var(--acc); color: #fff; }
+  button.off { background: #2a1416; border-color: #4a2226; }
+  .neutral { background: #f4f1ea; color: #111; } .cool { background: #dfe9ff; color: #111; } .warm { background: #ffd9a8; color: #111; }
+  label { display: block; color: var(--dim); margin: 18px 0 6px; }
+  input[type=range] { width: 100%; height: 40px; accent-color: var(--acc); }
+  .note { color: var(--dim); font-size: 14px; margin-top: 18px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Lights</h1>
+  <p id="status">Not connected</p>
+  <div class="grid">
+    <button id="connect" class="primary wide">Connect</button>
+    <button class="off" data-cmd='{"on":false}'>Off</button>
+    <button data-cmd='{"on":true}'>On</button>
+    <button class="neutral wide" data-cmd='{"on":true,"bri":255,"lor":2,"seg":{"fx":0,"col":[[0,0,0,255],[0,0,0,0],[0,0,0,0]],"cct":127}}'>Neutral white 100%</button>
+    <button class="cool" data-cmd='{"on":true,"bri":255,"lor":2,"seg":{"fx":0,"col":[[0,0,0,255],[0,0,0,0],[0,0,0,0]],"cct":255}}'>Cool 100%</button>
+    <button class="warm" data-cmd='{"on":true,"bri":255,"lor":2,"seg":{"fx":0,"col":[[0,0,0,255],[0,0,0,0],[0,0,0,0]],"cct":0}}'>Warm 100%</button>
+    <button class="wide" data-cmd='{"on":true,"lor":0}'>Back to SignalRGB</button>
+  </div>
+  <label for="bri">Brightness</label>
+  <input id="bri" type="range" min="1" max="255" value="128">
+  <p class="note">Talks to the bridge over Bluetooth, so your phone stays on its normal Wi-Fi. On iPhone open this page in the
+  Bluefy browser (Safari can't use Bluetooth). The first time, iOS asks for the 6-digit PIN shown on the WLED Link status page,
+  and the bridge only accepts a new phone while pairing is open there.</p>
+</main>
+<script>
+const SVC = "8d2a0001-3c55-4b6e-a7f1-6f2b5c0e9a41";
+const CMD = "8d2a0002-3c55-4b6e-a7f1-6f2b5c0e9a41";
+const STATE = "8d2a0003-3c55-4b6e-a7f1-6f2b5c0e9a41";
+const $ = (id) => document.getElementById(id);
+let device = null, cmdChr = null, stateChr = null, lastN = -1, busy = false, queued = null;
+
+function setStatus(text, cls = "") { $("status").textContent = text; $("status").className = cls; }
+function setEnabled(on) {
+  document.querySelectorAll("[data-cmd]").forEach((b) => (b.disabled = !on));
+  $("bri").disabled = !on;
+  $("connect").style.display = on ? "none" : "";
+}
+
+async function readState() {
+  const s = JSON.parse(new TextDecoder().decode(await stateChr.readValue()));
+  if (s.ok) {
+    setStatus(`${s.on ? "On" : "Off"}, brightness ${Math.round((s.bri / 255) * 100)}%${s.lor ? " (SignalRGB paused)" : ""}`, "ok");
+    if (s.bri > 0) $("bri").value = s.bri;
+  } else if (s.err) {
+    setStatus(s.err, "bad");
+  }
+  return s;
+}
+
+async function attach(dev) {
+  device = dev;
+  device.addEventListener("gattserverdisconnected", () => { setEnabled(false); setStatus("Disconnected"); });
+  setStatus("Connecting…");
+  const server = await device.gatt.connect();
+  const svc = await server.getPrimaryService(SVC);
+  cmdChr = await svc.getCharacteristic(CMD);
+  stateChr = await svc.getCharacteristic(STATE);
+  setStatus("Pairing… (type the PIN if iOS asks)");
+  await send({});  // reading the encrypted state is what triggers pairing the first time
+  setEnabled(true);
+}
+
+async function send(cmd) {
+  if (!cmdChr) return;
+  if (busy) { queued = cmd; return; }  // the latest tap wins once the current one is done
+  busy = true;
+  try {
+    await cmdChr.writeValueWithResponse(new TextEncoder().encode(JSON.stringify(cmd)));
+    const start = Date.now();
+    let s = await readState();
+    while (s.n === lastN && Date.now() - start < 5000) {  // the bridge answers once WLED has taken the command
+      await new Promise((r) => setTimeout(r, 250));
+      s = await readState();
+    }
+    lastN = s.n;
+  } catch (e) {
+    setStatus(`Didn't work: ${e.message}`, "bad");
+  } finally {
+    busy = false;
+    if (queued) { const next = queued; queued = null; send(next); }
+  }
+}
+
+$("connect").addEventListener("click", async () => {
+  if (!navigator.bluetooth) { setStatus("This browser has no Bluetooth. On iPhone use the Bluefy app.", "bad"); return; }
+  try {
+    await attach(await navigator.bluetooth.requestDevice({ filters: [{ services: [SVC] }] }));
+  } catch (e) {
+    setStatus(`Couldn't connect: ${e.message}`, "bad");
+  }
+});
+document.querySelectorAll("[data-cmd]").forEach((b) => b.addEventListener("click", () => send(JSON.parse(b.dataset.cmd))));
+$("bri").addEventListener("change", (e) => send({ on: true, bri: +e.target.value }));
+
+setEnabled(false);
+// Reconnect to the lamp picked last time without the chooser, where the browser allows it.
+if (navigator.bluetooth && navigator.bluetooth.getDevices) {
+  navigator.bluetooth.getDevices().then((devs) => { if (devs[0]) attach(devs[0]).catch(() => setStatus("Tap Connect")); });
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,332 @@
+"""End-to-end test: fake WLED <- fake bridge <- (socket:// "serial") <- wledlink.py <- HTTP/UDP clients.
+
+Runs the real wledlink.py in a subprocess, pointed at the software bridge. No hardware needed.
+    python pc/tests/test_wledlink.py
+"""
+
+import asyncio
+import hashlib
+import json
+import os
+import random
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, ".."))
+sys.path.insert(0, HERE)
+
+import wledlink as wl  # noqa: E402
+from fake_bridge import FakeBridge  # noqa: E402
+from fake_wled import BIG, HTML, FakeWled  # noqa: E402
+
+LISTEN = "127.0.0.9"
+HTTP_PORT = 18080
+BASE = f"http://{LISTEN}:{HTTP_PORT}"
+results = []
+
+
+def check(name, ok, detail=""):
+    results.append((name, bool(ok)))
+    print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f"  ({detail})" if detail and not ok else ""))
+
+
+def unit_tests():
+    print("framing")
+    check("crc16 matches CRC-16/CCITT-FALSE", __import__("binascii").crc_hqx(b"123456789", 0xFFFF) == 0x29B1)
+    cases = [b"", b"\x00", b"\x00\x00", b"\x01" * 253, b"\x01" * 254, b"\x01" * 255, b"\x01" * 254 + b"\x00",
+             b"\x00" + b"\x01" * 254, bytes(range(256)) * 3]
+    rng = random.Random(1)
+    cases += [bytes(rng.choice([0, 0, 1, 2, 255]) for _ in range(rng.randint(0, 2000))) for _ in range(300)]
+    ok = all(wl.cobs_decode(wl.cobs_encode(c)) == c and 0 not in wl.cobs_encode(c) for c in cases)
+    check("COBS round-trips (edge cases + 300 random)", ok)
+    frame = wl.encode_frame(0x91, 7, b"\x03hello\x00world")
+    check("frame round-trip", wl.decode_frame(frame[:-1]) == (0x91, 7, b"\x03hello\x00world"))
+    damaged = bytearray(frame[:-1])
+    damaged[4] ^= 0x10
+    check("damaged frame rejected", wl.decode_frame(bytes(damaged)) is None)
+
+
+def http(method, path, body=None, headers=None, timeout=15):
+    req = urllib.request.Request(BASE + path, data=body, method=method, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, dict(resp.headers), resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, dict(exc.headers), exc.read()
+
+
+async def ahttp(*args, **kw):
+    return await asyncio.to_thread(http, *args, **kw)
+
+
+async def status():
+    _, _, body = await ahttp("GET", "/__wledlink/status.json")
+    return json.loads(body)
+
+
+async def wait_for(pred, timeout, what):
+    deadline = time.monotonic() + timeout
+    last_exc = None
+    while time.monotonic() < deadline:
+        try:
+            if await pred():
+                return True
+        except Exception as exc:  # daemon not up yet, etc.
+            last_exc = exc
+        await asyncio.sleep(0.25)
+    print(f"    timed out waiting for {what} ({last_exc})")
+    return False
+
+
+async def wled_ready():
+    s = await status()
+    return s["wled"] is not None and s["bridge"]["state"] == "ready"
+
+
+async def json_info_ok():
+    code, _, body = await ahttp("GET", "/json/info/", timeout=5)
+    return code == 200 and json.loads(body).get("ip") == LISTEN
+
+
+async def raw_upgrade_session():
+    reader, writer = await asyncio.open_connection(LISTEN, HTTP_PORT)
+    writer.write(f"GET /ws HTTP/1.1\r\nHost: {LISTEN}:{HTTP_PORT}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n".encode())
+    head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
+    echoes = []
+    for msg in (b"hello", b"again after a pause"):
+        writer.write(msg)
+        await writer.drain()
+        echoes.append(await asyncio.wait_for(reader.readexactly(len(msg)), 5))
+        await asyncio.sleep(1.0)
+    writer.close()
+    return head, echoes
+
+
+async def e2e():
+    wled = FakeWled()
+    await wled.start()
+    bridge = FakeBridge(wled.http_addr, wled.udp_addr)
+    await bridge.start()
+    logdir = tempfile.mkdtemp(prefix="wledlink-test-")
+    env = dict(os.environ, WLEDLINK_HOME=logdir)
+    log_path = os.path.join(logdir, "daemon.out")
+    out = open(log_path, "w")
+    daemon = subprocess.Popen(
+        [sys.executable, os.path.join(HERE, "..", "wledlink.py"), "--listen", LISTEN, "--http-port", str(HTTP_PORT),
+         "run", "--port", f"socket://127.0.0.1:{bridge.port}", "-v"],
+        stdout=out, stderr=subprocess.STDOUT, env=env)
+    try:
+        print("startup")
+        check("daemon finds bridge and WLED", await wait_for(wled_ready, 20, "WLED to become reachable"))
+        s = await status()
+        check("status reports bridge Wi-Fi", s["bridge"].get("ssid") == "WLEDLink" and s["bridge"].get("password"))
+        check("status reports WLED details", s["wled"] and s["wled"]["leds"] == 80 and s["wled"]["name"] == "Test WLED")
+        check("listening on realtime UDP port", 21324 in s["udpListening"], s["udpListening"])
+
+        print("what SignalRGB does")
+        code, _, body = await ahttp("GET", "/json/info/", headers={"Accept": "application/json"})
+        info = json.loads(body)
+        check("GET /json/info/ answers with brand WLED", code == 200 and info.get("brand") == "WLED")
+        check("info.ip rewritten to the loopback address", info.get("ip") == LISTEN, info.get("ip"))
+        code, _, body = await ahttp("GET", "/json/")
+        full = json.loads(body)
+        check("GET /json/ rewritten too", code == 200 and full["info"]["ip"] == LISTEN and "state" in full)
+        code, _, body = await ahttp("GET", "/json/si")
+        si = json.loads(body)
+        check("chunked /json/si decoded and rewritten", code == 200 and si["info"]["ip"] == LISTEN)
+        code, _, _ = await ahttp("POST", "/json/state/", json.dumps({"on": True, "bri": 255, "live": False}).encode(),
+                                 {"Content-Type": "application/json"})
+        check("POST /json/state reaches WLED", code == 200 and wled.posts and wled.posts[-1].get("bri") == 255)
+        led_count = 80
+        sent = []
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        for frame in range(30):
+            pkt = bytes([4, 2, 0, 0]) + bytes((frame + i) & 0xFF for i in range(led_count * 3))
+            sent.append(pkt)
+            sock.sendto(pkt, (LISTEN, 21324))
+            await asyncio.sleep(1 / 60)
+        sock.close()
+        await asyncio.sleep(0.5)
+        got = [d for _, d in wled.udp_packets]
+        check("DNRGB colour packets arrive at WLED", len(got) >= 28 and all(g in sent for g in got), f"{len(got)}/30")
+
+        print("web UI traffic")
+        code, headers, body = await ahttp("GET", "/", headers={"Accept": "text/html"})
+        check("GET / passes the UI through byte-for-byte", code == 200 and body == HTML)
+        check("responses are marked Connection: close", headers.get("Connection", "").lower() == "close")
+        t0 = time.monotonic()
+        code, _, body = await ahttp("GET", "/big")
+        check("300 KB download intact", code == 200 and body == BIG, f"{len(body)} bytes")
+        print(f"         ({len(body) / (time.monotonic() - t0) / 1024:.0f} KB/s over the fake link)")
+        upload = os.urandom(200_000)
+        code, _, body = await ahttp("POST", "/echo", upload, {"Content-Type": "application/octet-stream"})
+        reply = json.loads(body) if code == 200 else {}
+        check("200 KB upload intact", reply.get("sha") == hashlib.sha256(upload).hexdigest(), reply)
+        check("upload never exceeded the bridge's window", bridge.window_violations == 0, bridge.window_violations)
+        codes = await asyncio.gather(*(ahttp("GET", "/slow") for _ in range(14)))
+        check("14 parallel requests share 8 bridge slots", all(c[0] == 200 for c in codes), [c[0] for c in codes])
+        head, echoes = await raw_upgrade_session()
+        check("websocket-style upgrade stays open and echoes", head.startswith(b"HTTP/1.1 101") and echoes == [b"hello", b"again after a pause"])
+        await asyncio.sleep(0.5)
+        s = await status()
+        check("no tunnel connections leaked", s["openConnections"] == 0 and wled.active == 0,
+              f"daemon {s['openConnections']}, wled {wled.active}")
+        check("PC clock was sent to WLED", any("time" in p for p in wled.posts))
+
+        print("status page and quick actions")
+        code, _, body = await ahttp("GET", "/__wledlink")
+        check("status page served", code == 200 and b"Neutral white 100%" in body)
+        s = await status()
+        settings = (s["wled"] or {}).get("settings") or {}
+        check("WLED settings read for the status page", settings.get("readable") and settings.get("apBehavior") == 0, settings)
+
+        print("white buttons")
+        led, gamma = wled.cfg["hw"]["led"], wled.cfg["light"]["gc"]
+        led["rgbwm"] = 3  # a global auto-white override (Dual) that a careless partial update would wipe
+        reply = await white("neutral")
+        seg = wled.posts[-1].get("seg", {})
+        check("neutral: both white channels at full (CCT 127, white only, 100%)",
+              reply.get("ok") and seg.get("cct") == 127 and seg["col"][0] == [0, 0, 0, 255]
+              and wled.posts[-1].get("bri") == 255 and wled.posts[-1].get("lor") == 2, (reply, wled.posts[-1]))
+        check("neutral: turned on 100% CCT additive blending", led["cb"] == 100 and any("blending" in n for n in reply["notes"]), led)
+        check("settings change left gamma, auto-white and frame rate alone",
+              gamma["col"] == 2.8 and gamma["bri"] == 1 and led["rgbwm"] == 3 and led["fps"] == 42, (gamma, led))
+        check("settings change did not restart the LED outputs", wled.bus_reinits == 0)
+        posts = len(wled.cfg_posts)
+        reply = await white("cool")
+        check("cool: cool white only (CCT 255)", reply.get("ok") and wled.posts[-1]["seg"]["cct"] == 255
+              and len(wled.cfg_posts) == posts, (reply, wled.posts[-1]))
+        rc = await cli("white", "warm", "--brightness", "50")
+        check("'wledlink.py white warm' command", rc.returncode == 0 and wled.posts[-1]["seg"]["cct"] == 0
+              and abs(wled.posts[-1]["bri"] - 128) <= 1, rc.stdout + rc.stderr)
+        led["rgbwm"] = 2  # Accurate: white has to be asked for as full RGB
+        await white("neutral")
+        check("adapts to 'Accurate' auto-white (RGB white -> white LEDs)", wled.posts[-1]["seg"]["col"][0] == [255, 255, 255, 0])
+        led["rgbwm"] = 1
+        reply = await white("neutral")
+        check("explains 'Brighter' auto-white mixes RGB in", any("Brighter" in n for n in reply["notes"]))
+        led["rgbwm"], led["cb"], wled.cfg_locked = 3, 0, True
+        reply = await white("neutral")
+        check("PIN-locked settings: still switches to white and says how to finish",
+              reply.get("ok") and wled.posts[-1]["seg"]["cct"] == 127 and any("100%" in n for n in reply["notes"]), reply)
+        wled.cfg_locked = False
+        rc = await cli("wled-hotspot", "fallback")
+        check("'wled-hotspot fallback' makes WLED open its hotspot whenever it loses the bridge",
+              rc.returncode == 0 and wled.cfg["ap"]["behav"] == 1 and gamma["col"] == 2.8 and led["rgbwm"] == 3, rc.stdout + rc.stderr)
+        rc = await cli("wled-hotspot", "off")
+        check("'wled-hotspot off' turns WLED's hotspot off", rc.returncode == 0 and wled.cfg["ap"]["behav"] == 3, rc.stdout + rc.stderr)
+        s = await status()
+        check("status reports the hotspot mode", s["wled"]["settings"].get("apBehavior") == 3)
+        check("status reports the bridge Wi-Fi mode", s["bridge"].get("wifiWithPc") is False, s["bridge"])
+        rc = await cli("signalrgb")
+        check("'wledlink.py signalrgb' command hands control back", rc.returncode == 0 and wled.state.get("lor") == 0, rc.stdout + rc.stderr)
+        rc = await cli("status")
+        check("'wledlink.py status' command", rc.returncode == 0 and "Test WLED" in rc.stdout, rc.stdout + rc.stderr)
+
+        print("browser security")
+        code, _, _ = await ahttp("GET", "/__wledlink/status.json", headers={"Host": "evil.example"})
+        check("DNS-rebinding style Host header refused", code == 403)
+        code, _, _ = await ahttp("GET", "/json/info", headers={"Sec-Fetch-Site": "cross-site"})
+        check("cross-site request from another website refused", code == 403)
+        posts = len(wled.posts)
+        code, _, _ = await ahttp("POST", "/json/state", b'{"on":false}',
+                                 {"Content-Type": "application/json", "Origin": "http://evil.example"})
+        check("POST from another website's page refused", code == 403 and len(wled.posts) == posts)
+        code, _, _ = await ahttp("POST", "/__wledlink/api/white", b'{"tone":"cool"}',
+                                 {"Origin": f"http://{LISTEN}:{HTTP_PORT}", "Sec-Fetch-Site": "same-origin"})
+        check("the status page's own requests still work", code == 200)
+        code, _, _ = await ahttp("POST", "/__wledlink/api/white", b'["not", "an object"]')
+        check("malformed API input rejected cleanly", code == 400)
+
+        print("recovery")
+        sessions = bridge.sessions
+        bridge.reboot()
+        check("recovers after the bridge reboots", await wait_for(json_info_ok, 10, "recovery after reboot")
+              and bridge.sessions > sessions)
+        gaps_before = (await status())["stats"].get("resyncs", 0)
+        bridge.drop_next = True
+        await asyncio.sleep(2.5)  # the dropped frame is a PONG; the next one exposes the gap
+        s = await status()
+        check("detects a lost frame and resyncs", s["stats"].get("resyncs", 0) > gaps_before, s["stats"])
+        check("works after the resync", await wait_for(json_info_ok, 10, "recovery after lost frame"))
+        bridge.garbage(500)
+        await asyncio.sleep(0.5)
+        check("ignores garbage on the serial line", await wait_for(json_info_ok, 10, "recovery after garbage"))
+        bridge.unplug()
+        await asyncio.sleep(1)
+        check("reconnects after the bridge is unplugged and replugged",
+              await wait_for(json_info_ok, 20, "reconnect after unplug"))
+
+        print("WLED leaving and coming back")
+        bridge.set_stations([])
+        check("notices WLED left", await wait_for(lambda: _no_wled(), 15, "WLED to disappear"))
+        code, headers, _ = await ahttp("GET", "/", headers={"Accept": "text/html"})
+        check("browser gets sent to the status page", code in (200, 302))
+        code, _, body = await ahttp("GET", "/json/info/", headers={"Accept": "application/json"})
+        check("SignalRGB gets a clean 503", code == 503 and "error" in json.loads(body))
+        bridge.set_stations([{"mac": "aa:bb:cc:dd:ee:ff", "ip": "192.168.77.2", "rssi": -40}])
+        check("finds WLED again when it rejoins", await wait_for(json_info_ok, 15, "WLED to come back"))
+
+        print("bridge settings")
+        payload = wl.config_payload({"ssid": "NewNet", "password": "longenough1", "channel": 6})
+        code, _, body = await ahttp("POST", "/__wledlink/api/bridge-config",
+                                    json.dumps({"ssid": "NewNet", "password": "longenough1", "channel": 6}).encode())
+        check("bridge-config reaches the bridge", code == 200 and json.loads(body).get("ok") and bridge.config_payloads[-1] == payload)
+        check("still works after the config reboot", await wait_for(json_info_ok, 10, "recovery after config"))
+
+        print("stopping")
+        rc = await cli("stop")
+        exited = await asyncio.to_thread(lambda: daemon.wait(10) is not None)
+        check("'wledlink.py stop' ends the running link", rc.returncode == 0 and exited, rc.stdout + rc.stderr)
+    finally:
+        daemon.terminate()
+        with contextlib_suppress():
+            daemon.wait(5)
+        out.close()
+        bridge.close()
+        wled.close()
+        if not all(ok for _, ok in results):
+            print("\n--- daemon log ---")
+            print(open(log_path).read()[-6000:])
+
+
+async def white(tone):
+    _, _, body = await ahttp("POST", "/__wledlink/api/white", json.dumps({"tone": tone, "brightness": 100}).encode())
+    return json.loads(body)
+
+
+async def cli(*args):
+    """Runs a wledlink.py command without blocking the event loop the fakes live on."""
+    cmd = [sys.executable, os.path.join(HERE, "..", "wledlink.py"), "--listen", LISTEN, "--http-port", str(HTTP_PORT), *args]
+    return await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=30)
+
+
+async def _no_wled():
+    s = await status()
+    return s["wled"] is None
+
+
+class contextlib_suppress:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return True
+
+
+def main():
+    unit_tests()
+    asyncio.run(e2e())
+    failed = [n for n, ok in results if not ok]
+    print(f"\n{len(results) - len(failed)}/{len(results)} checks passed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
