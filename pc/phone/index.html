@@ -186,9 +186,11 @@ function render() {
     : linkState === "connecting" ? "Connecting" : retrying ? "Reconnecting" : "Not connected";
   $("connect").disabled = linkState === "connecting";
   $("connect").textContent = linkState === "connecting" ? "Connecting…" : "Connect";
-  $("connectTitle").textContent = retrying ? "Reconnecting…" : "Connect to your light";
-  if (navigator.bluetooth) $("connectText").textContent = retrying
-    ? "Looking for the light. It reconnects by itself as soon as the bridge is back."
+  const stuck = retrying && retries >= 4;  // ~10 s of failed tries: the remembered light may be out of date
+  $("connectTitle").textContent = stuck ? "Can't reach the light" : retrying ? "Reconnecting…" : "Connect to your light";
+  if (navigator.bluetooth) $("connectText").textContent = stuck
+    ? "Still trying. If the bridge is on, tap Connect and pick Lamp again (after Forget phones on the PC, also remove Lamp in iPhone Settings > Bluetooth)."
+    : retrying ? "Looking for the light. It reconnects by itself as soon as the bridge is back."
     : "Your phone talks to the bridge over Bluetooth, so it stays on its normal Wi-Fi.";
   if (!connected) { document.documentElement.style.setProperty("--level", 0); return; }
 
@@ -286,12 +288,21 @@ async function reconnect() {
 }
 $("connect").addEventListener("click", async () => {
   if (!navigator.bluetooth) { toast("This browser has no Bluetooth. On iPhone, open this page in Bluefy."); return; }
+  // Always through the device picker: a remembered device can go stale (the bridge forgot its phones, or
+  // was reflashed), and then trying it again and again gets nowhere.
+  clearTimeout(retryTimer);
+  wantConnected = false;
+  if (device && device.gatt.connected) device.gatt.disconnect();
+  device = null;
   try {
-    const dev = device || await navigator.bluetooth.requestDevice({filters: [{services: [SVC]}]});
-    await attach(dev);
+    await attach(await navigator.bluetooth.requestDevice({filters: [{services: [SVC]}]}));
   } catch (e) {
     linkState = "idle"; render();
-    if (e && e.name !== "NotFoundError") toast(/security|auth|insufficient/i.test(e.message) ? "Pairing wasn't accepted. Open pairing on the PC and try again." : "Couldn't connect. Is the bridge powered?");
+    if (e && e.name === "NotFoundError") return;  // picker closed
+    const msg = (e && (e.message || e.name)) || "";
+    toast(/security|auth|insufficient|encrypt|pair/i.test(msg)
+      ? "Pairing didn't work. On the iPhone, remove \"Lamp\" in Settings > Bluetooth, press Pair a phone on the PC, then Connect again."
+      : `Couldn't connect (${msg || "no answer"}). If it keeps happening, remove "Lamp" in iPhone Settings > Bluetooth and pair again.`);
   }
 });
 $("disconnect").addEventListener("click", () => { wantConnected = false; if (device && device.gatt.connected) device.gatt.disconnect(); });

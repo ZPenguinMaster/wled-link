@@ -13,4 +13,5 @@ void phoneForget();
 bool phoneSetPin(uint32_t pin);
 uint32_t phonePin();
 int phoneCount();
+int phoneDiag(char* out, size_t cap);  // "c1 a1 r0 x0": connections, advertising, advertising restarts, pairings refused
 int phonePairingLeft();  // seconds, 0 = closed

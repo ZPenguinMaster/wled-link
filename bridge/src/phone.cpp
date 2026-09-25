@@ -2,6 +2,7 @@
 
 #include <NimBLEDevice.h>
 #include <Preferences.h>
+#include <algorithm>
 
 #include "config.h"
 #include "wled.h"
@@ -35,6 +36,8 @@ static uint32_t pin = 0;
 static volatile uint32_t pairingUntil = 0;
 static NimBLEServer* server = nullptr;
 static NimBLECharacteristic* stateChr = nullptr;
+// diagnostics: times advertising had to be restarted, pairings refused
+static volatile uint32_t advRestarts = 0, refused = 0;
 static portMUX_TYPE listMux = portMUX_INITIALIZER_UNLOCKED;  // phones[] and links[] are shared with the BLE task
 
 // ---------------------------------------------------------------------------------------------
@@ -141,6 +144,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     portENTER_CRITICAL(&listMux);
     if (Link* l = linkFor(desc->conn_handle, false)) *l = Link();
     portEXIT_CRITICAL(&listMux);
+    NimBLEDevice::startAdvertising();  // findable again (phoneLoop checks too)
   }
 
   uint32_t onPassKeyRequest() override { return pin; }
@@ -156,6 +160,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
       }
     }
     if (!ok) {
+      refused++;
       NimBLEDevice::deleteBond(NimBLEAddress(desc->peer_id_addr));
       server->disconnect(desc->conn_handle);
       return;
@@ -244,6 +249,22 @@ void phoneLoop() {
     if (l.handle != 0xFFFF && !l.approved && millis() - l.since > UNPAIRED_KICK_MS && kick == 0xFFFF) kick = l.handle;
   portEXIT_CRITICAL(&listMux);
   if (kick != 0xFFFF) server->disconnect(kick);
+
+  // Our own link table and NimBLE's connection list must agree, and a phone must always be able to find the
+  // bridge while there is room for another connection. Checked every 2 s, so nothing can stay stuck.
+  static uint32_t lastCheck = 0;
+  if (server && millis() - lastCheck > 2000) {
+    lastCheck = millis();
+    std::vector<uint16_t> peers = server->getPeerDevices();
+    portENTER_CRITICAL(&listMux);
+    for (auto& l : links)
+      if (l.handle != 0xFFFF && std::find(peers.begin(), peers.end(), l.handle) == peers.end()) l = Link();  // gone
+    portEXIT_CRITICAL(&listMux);
+    if ((int)peers.size() < MAX_CONN && !NimBLEDevice::getAdvertising()->isAdvertising()) {
+      advRestarts++;
+      NimBLEDevice::startAdvertising();
+    }
+  }
 }
 
 void phoneEnd() { NimBLEDevice::deinit(true); }
@@ -273,6 +294,12 @@ bool phoneSetPin(uint32_t newPin) {
 }
 
 uint32_t phonePin() { return pin; }
+
+int phoneDiag(char* out, size_t cap) {
+  int conns = server ? (int)server->getConnectedCount() : 0;
+  bool adv = NimBLEDevice::getAdvertising()->isAdvertising();
+  return snprintf(out, cap, "c%d a%d r%lu x%lu", conns, adv ? 1 : 0, (unsigned long)advRestarts, (unsigned long)refused);
+}
 int phoneCount() { return numPhones; }
 
 int phonePairingLeft() {

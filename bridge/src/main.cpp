@@ -292,16 +292,17 @@ static size_t jsonEscape(char* out, size_t cap, const char* s) {
 
 // Counters shared by INFO and STATS (no braces, so it can be spliced into either object).
 static int formatStats(char* out, size_t cap) {
-  char lk[96];
+  char lk[96], ble[48];
   linkStatsText(lk, sizeof lk);
+  phoneDiag(ble, sizeof ble);
   return snprintf(out, cap,
       "\"uptime\":%lu,\"heap\":%lu,\"minHeap\":%lu,\"sta\":%d,\"udpTx\":%lu,\"udpDrop\":%lu,\"rxBad\":%lu,\"rxGaps\":%lu,"
-      "\"tcpOpened\":%lu,\"phones\":%d,\"phonePin\":\"%06lu\",\"pairing\":%d,\"linkUp\":%d,\"lkSent\":%lu,\"lkLost\":%lu,\"lkStalls\":%lu,\"lk\":\"%s\"",
+      "\"tcpOpened\":%lu,\"phones\":%d,\"phonePin\":\"%06lu\",\"pairing\":%d,\"linkUp\":%d,\"lkSent\":%lu,\"lkLost\":%lu,\"lkStalls\":%lu,\"lk\":\"%s\",\"ble\":\"%s\"",
       (unsigned long)(millis() / 1000), (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMinFreeHeap(),
       staCount, (unsigned long)stats.udpTx,
       (unsigned long)stats.udpDrop, (unsigned long)stats.rxBad, (unsigned long)stats.rxGaps,
       (unsigned long)stats.tcpOpened, phoneCount(), (unsigned long)phonePin(), phonePairingLeft(), linkUp() ? 1 : 0,
-      (unsigned long)linkFramesSent(), (unsigned long)linkFramesLost(), (unsigned long)linkStalls(), lk);
+      (unsigned long)linkFramesSent(), (unsigned long)linkFramesLost(), (unsigned long)linkStalls(), lk, ble);
 }
 
 static void sendInfo() {

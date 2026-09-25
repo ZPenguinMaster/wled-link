@@ -1522,7 +1522,7 @@ class Bridge:
                 "txPowerDbm": (info.get("txq") or 0) / 4, "wifiWithPc": bool(info.get("withPc")),
                 "uptime": counters.get("uptime"),
                 "phones": counters.get("phones"), "phonePin": counters.get("phonePin"),
-                "phonePairing": counters.get("pairing"),
+                "phonePairing": counters.get("pairing"), "ble": counters.get("ble"),
                 "freeHeap": counters.get("heap"), "minFreeHeap": counters.get("minHeap"), "udpSent": counters.get("udpTx"),
                 "udpFailed": counters.get("udpDrop"), "badFrames": counters.get("rxBad"),
                 "lostFrames": counters.get("rxGaps"),
