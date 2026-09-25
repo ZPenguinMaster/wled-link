@@ -34,6 +34,7 @@ static State state;
 static volatile uint32_t seq = 0;
 static volatile bool connected = false;
 static QueueHandle_t cmds = nullptr;
+static TaskHandle_t taskHandle = nullptr;  // woken whenever there is a command or a state report for it
 
 static uint32_t wledIp = 0;  // network byte order, 0 = look it up
 static int sock = -1;
@@ -398,30 +399,28 @@ static void drainLinkStates() {
   }
 }
 
-// ESP-NOW mode: no WebSocket; commands go out through main.cpp's radio link.
-static void linkTask() {
+static void applyCommands() {
   static Cmd cmd;
-  if (xQueueReceive(cmds, &cmd, pdMS_TO_TICKS(5)) == pdTRUE) {
+  while (xQueueReceive(cmds, &cmd, 0) == pdTRUE) {
     cmd.json[cmd.len] = 0;
     applyCommand(cmd);
   }
-  drainLinkStates();
-  setConnected(linkIsUp);
-  trackStream();
 }
 
 static void task(void*) {
-  static Cmd cmd;
   for (;;) {
-    if (overLink) {
-      linkTask();
+    // asleep until there's work (a command, a state report) or it's time to look at the stream and the socket
+    uint32_t idleMs = overLink ? 5 : sock >= 0 ? 2 : 50;
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(idleMs));
+    if (overLink) {  // ESP-NOW mode: no WebSocket; commands go out through main.cpp's radio link
+      applyCommands();
+      drainLinkStates();
+      setConnected(linkIsUp);
+      trackStream();
       continue;
     }
     if (sock < 0 && millis() - lastTryMs > RETRY_MS) connectWs();
-    if (xQueueReceive(cmds, &cmd, pdMS_TO_TICKS(sock >= 0 ? 2 : 50)) == pdTRUE) {
-      cmd.json[cmd.len] = 0;
-      applyCommand(cmd);
-    }
+    applyCommands();
     drainLinkStates();
     trackStream();
     if (sock < 0) continue;
@@ -455,7 +454,7 @@ void wledBegin(bool viaLink) {
   cmds = xQueueCreate(8, sizeof(Cmd));
   linkCmds = xQueueCreate(8, sizeof(Cmd));
   linkStates = xQueueCreate(4, LINK_STATE_MAX + 1);
-  xTaskCreatePinnedToCore(task, "wled", 8192, nullptr, 2, nullptr, 1);
+  xTaskCreatePinnedToCore(task, "wled", 8192, nullptr, 2, &taskHandle, 1);
 }
 
 bool wledSend(const char* json, size_t len) {
@@ -463,15 +462,17 @@ bool wledSend(const char* json, size_t len) {
   Cmd cmd;
   cmd.len = len;
   memcpy(cmd.json, json, len);
-  if (xQueueSend(cmds, &cmd, 0) == pdTRUE) return true;
-  // full: drop the oldest so the newest input always gets through
-  Cmd old;
-  xQueueReceive(cmds, &old, 0);
-  return xQueueSend(cmds, &cmd, 0) == pdTRUE;
+  bool ok = xQueueSend(cmds, &cmd, 0) == pdTRUE;
+  if (!ok) {  // full: drop the oldest so the newest input always gets through
+    Cmd old;
+    xQueueReceive(cmds, &old, 0);
+    ok = xQueueSend(cmds, &cmd, 0) == pdTRUE;
+  }
+  if (taskHandle) xTaskNotifyGive(taskHandle);
+  return ok;
 }
 
 uint32_t wledStateSeq() { return seq; }
-bool wledConnected() { return connected; }
 void wledNoteStream() { lastStreamMs = millis() | 1; }  // | 1: 0 means "no stream yet"
 void wledCheckLink() { probeWanted = true; }
 
@@ -492,6 +493,7 @@ void wledLinkState(const char* json, size_t len) {
     xQueueReceive(linkStates, old, 0);
     xQueueSend(linkStates, buf, 0);
   }
+  if (taskHandle) xTaskNotifyGive(taskHandle);
 }
 
 void wledLinkUp(bool up) { linkIsUp = up; }

@@ -133,7 +133,6 @@ class Link {
     haveKey = true;
     if (changed) goDown();
   }
-  bool hasKey() const { return haveKey; }
 
   // Bridge side: what the HELLO announces.
   void setAnnounce(uint8_t mode, uint8_t channel) { annMode = mode; annChannel = channel; }
@@ -160,7 +159,6 @@ class Link {
   bool handshaking() const { return shaking; }  // WLED side: answered a HELLO, waiting for the bridge to confirm
   const uint8_t* peer() const { return peerMac; }
   bool hasPeer() const { return havePeer; }
-  uint32_t lastHeard() const { return lastRx; }
 
   size_t sendRoom() const { return q ? TXQ - qLen : 0; }
 

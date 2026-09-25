@@ -117,7 +117,9 @@ and stays on its normal Wi-Fi, and the bridge passes the commands on to WLED.
 [pc/phone/index.html](pc/phone/index.html) is the phone's control page, built like the one on the PC:
 power, a brightness slider, and tiles for PC Sync and the three whites at 100%. The bridge pushes every
 change to the phone, so the page also shows what you did on the PC, and the other way round. It
-reconnects by itself when you come back to it.
+reconnects by itself when you come back to it: the controls show at once with the light's last state, and
+whatever you tap while it connects goes out the moment the link is up (the bridge advertises every 20 ms for
+30 s after a phone leaves, so that's usually well under a second).
 
 **Locked to your phone:** the control only works over an encrypted link paired with a 6-digit PIN, shown
 on the control page. On top of that, the bridge only accepts phones that paired while you had pairing open:
@@ -330,8 +332,8 @@ state, which it reports back at once.
 - WLED doesn't announce when a SignalRGB stream starts or stops, but every stream passes through the
   bridge, so the bridge tells the pages itself.
 
-A click on the PC page shows up on every open page in about 16 ms, and WLED's own confirmation follows about
-10 ms later (measured over ESP-NOW: 27 ms from the click, 47 ms at worst).
+A click on the PC page shows up on every open page in about 14 ms, and WLED's own confirmation is back just as
+fast (measured over ESP-NOW: 14 ms from the click, 33 ms at worst).
 
 **Security.** The link only listens on this PC's loopback address, so other machines can't reach it. It
 also refuses requests that come from other websites open in your browser: cross-site requests, POSTs

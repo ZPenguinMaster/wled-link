@@ -556,7 +556,6 @@ void pumpLink() {
     hunting = false;
     lastHunt = now;
   }
-  wlink.tick(now);
   if (wlink.up()) {
     pumpConns();
     if (stateDirty && now - lastStatePush >= 20) {
@@ -564,6 +563,7 @@ void pumpLink() {
       pushState();
     }
   }
+  wlink.tick(now);  // last: what was just queued (web server answers, the state) goes out now, not next time
 }
 
 }  // namespace

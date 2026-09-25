@@ -13,7 +13,6 @@ void wledBegin(bool overLink);  // overLink: ESP-NOW mode, no WebSocket; command
 bool wledSend(const char* json, size_t len);       // queue a WLED JSON state command
 uint32_t wledStateSeq();                            // changes whenever the state below changes
 size_t wledStateJson(char* out, size_t cap);        // {"n":..,"ws":1,"on":1,"bri":..,"lor":..,"live":..,"ps":..,"fx":..,"cct":..,"col":[r,g,b,w]}
-bool wledConnected();
 void wledNoteStream();  // the bridge just passed realtime LED data (SignalRGB) on to WLED
 void wledCheckLink();   // a device joined or left the Wi-Fi: make sure the WebSocket still reaches WLED
 // ESP-NOW mode

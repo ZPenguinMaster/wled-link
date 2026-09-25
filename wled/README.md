@@ -18,7 +18,7 @@ release, with the AudioReactive usermod, like the release file on GitHub) plus t
   - while WLED waits to restart it keeps the usermod running, so its last answer (such as "Update
     successful") still gets back over the radio.
 
-Its version code is 2606309 (official 16.0.1: 2606300), which is how you can tell it apart in WLED's Info
+Its version code is 2606310 (official 16.0.1: 2606300), which is how you can tell it apart in WLED's Info
 page. Settings and presets stay as they are.
 
 - **Install**, through the link: `python pc\wledlink.py wled-update`. It uploads with WLED's own update page,

@@ -997,9 +997,9 @@ void loop() {
   if (hostActive && now - lastHostRxMs > HOST_TIMEOUT_MS) endSession();
   if (settings.withPc && apOn && now - lastHostRxMs > AP_IDLE_OFF_MS) apStop();
   if (!hostActive && now - lastBeaconMs >= BEACON_INTERVAL_MS) sendInfo();
-  linkLoop();
-  char cmd[512];
+  char cmd[512];  // taps from the PC and the phone: queued first, so this pass of the link sends them
   for (size_t n; espnow() && (n = wledTakeLinkCmd(cmd, sizeof cmd));) linkSendMsg(H_WLED_CMD, (const uint8_t*)cmd, n);
+  linkLoop();
   if (staDirty) {
     staDirty = false;
     if (hostActive) sendStaList();

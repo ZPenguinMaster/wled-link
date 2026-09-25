@@ -12,15 +12,13 @@ static const char* SVC_UUID = "8d2a0001-3c55-4b6e-a7f1-6f2b5c0e9a41";
 static const char* CMD_UUID = "8d2a0002-3c55-4b6e-a7f1-6f2b5c0e9a41";    // write: WLED JSON state, e.g. {"on":false}
 static const char* STATE_UUID = "8d2a0003-3c55-4b6e-a7f1-6f2b5c0e9a41";  // read/notify: the light's state (wledStateJson)
 
-static const int MAX_PHONES = 3;  // NimBLE keeps 3 bonds (CONFIG_BT_NIMBLE_MAX_BONDS)
 static const int MAX_CONN = 3;
 static const int BOOT_BUTTON = 0;
 static const uint32_t UNPAIRED_KICK_MS = 30000;  // connections that don't pair in time get dropped
-
-struct PhoneId {
-  uint8_t type;
-  uint8_t addr[6];
-};
+// Apple's advice for accessories: advertise every 20 ms while a phone may be about to connect (here: for 30 s
+// after the bridge starts or a phone leaves, so reopening the phone page finds it at once), then at 152.5 ms.
+static const uint16_t ADV_FAST = 32, ADV_SLOW = 244;  // units of 0.625 ms
+static const uint32_t ADV_FAST_MS = 30000;
 
 struct Link {
   uint16_t handle = 0xFFFF;  // 0xFFFF = unused
@@ -29,8 +27,6 @@ struct Link {
   bool subscribed = false;    // asked for state notifications
 };
 
-static PhoneId phones[MAX_PHONES];
-static int numPhones = 0;
 static Link links[MAX_CONN];
 static uint32_t pin = 0;
 static volatile uint32_t pairingUntil = 0;
@@ -40,28 +36,14 @@ static NimBLECharacteristic* stateChr = nullptr;
 static volatile uint32_t advRestarts = 0, refused = 0;
 static volatile uint32_t passkeyAt = 0;  // when a new pairing last asked for the PIN
 static volatile uint8_t lastRefusal = 0; // bits: 1 encrypted, 2 authenticated, 4 new pairing, 8 pairing was open
-static portMUX_TYPE listMux = portMUX_INITIALIZER_UNLOCKED;  // phones[] and links[] are shared with the BLE task
+static volatile uint32_t fastAdvUntil = 0;
+static portMUX_TYPE listMux = portMUX_INITIALIZER_UNLOCKED;  // links[] is shared with the BLE task
 
-// ---------------------------------------------------------------------------------------------
-// paired phones (our own allowlist, on top of NimBLE's bond store)
-
-static void savePhones() {
-  PhoneId copy[MAX_PHONES];
-  portENTER_CRITICAL(&listMux);
-  int n = numPhones;
-  memcpy(copy, phones, sizeof copy);
-  portEXIT_CRITICAL(&listMux);
-  Preferences p;
-  if (p.begin("wlble", false)) {
-    p.putBytes("ids", copy, n * sizeof(PhoneId));
-    p.end();
-  }
-}
-
-static void loadPhones() {
+// The phones allowed in are the ones the bridge holds a pairing (bond) for: it only keeps pairings made while
+// pairing was open, and "Forget phones" deletes them all.
+static void loadPin() {
   Preferences p;
   if (p.begin("wlble", true)) {
-    numPhones = p.getBytes("ids", phones, sizeof phones) / sizeof(PhoneId);
     pin = p.getUInt("pin", 0);
     p.end();
   }
@@ -75,27 +57,12 @@ static void loadPhones() {
   }
 }
 
-static bool known(const ble_addr_t& a) {
-  bool found = false;
-  portENTER_CRITICAL(&listMux);
-  for (int i = 0; i < numPhones && !found; i++)
-    found = phones[i].type == a.type && memcmp(phones[i].addr, a.val, 6) == 0;
-  portEXIT_CRITICAL(&listMux);
-  return found;
-}
-
-static void addPhone(const ble_addr_t& a) {
-  if (known(a)) return;
-  portENTER_CRITICAL(&listMux);
-  if (numPhones == MAX_PHONES) {  // forget the oldest
-    memmove(phones, phones + 1, (MAX_PHONES - 1) * sizeof(PhoneId));
-    numPhones--;
-  }
-  phones[numPhones].type = a.type;
-  memcpy(phones[numPhones].addr, a.val, 6);
-  numPhones++;
-  portEXIT_CRITICAL(&listMux);
-  savePhones();
+static void advertise(bool fast) {
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  if (adv->isAdvertising()) adv->stop();
+  adv->setMinInterval(fast ? ADV_FAST : ADV_SLOW);
+  adv->setMaxInterval(fast ? ADV_FAST : ADV_SLOW);
+  adv->start();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -138,15 +105,19 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     portENTER_CRITICAL(&listMux);
     linkFor(desc->conn_handle, true);
     portEXIT_CRITICAL(&listMux);
-    NimBLEDevice::startSecurity(desc->conn_handle);  // iOS asks for the PIN the first time
-    NimBLEDevice::startAdvertising();                // stay discoverable for another phone
+    NimBLEDevice::startSecurity(desc->conn_handle);  // encrypted at once (iOS asks for the PIN the first time)
+    // 15-30 ms connection events (Apple's fastest) from the start, so setting up the page's link is quick too
+    server->updateConnParams(desc->conn_handle, 12, 24, 0, 400);
+    fastAdvUntil = 0;
+    advertise(false);  // stay discoverable for another phone
   }
 
   void onDisconnect(NimBLEServer* s, ble_gap_conn_desc* desc) override {
     portENTER_CRITICAL(&listMux);
     if (Link* l = linkFor(desc->conn_handle, false)) *l = Link();
     portEXIT_CRITICAL(&listMux);
-    NimBLEDevice::startAdvertising();  // findable again (phoneLoop checks too)
+    fastAdvUntil = millis() + ADV_FAST_MS;  // the phone may be back in a moment
+    advertise(true);
   }
 
   // Only a new pairing asks for the PIN; a phone coming back encrypts with the pairing it already has.
@@ -165,10 +136,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     passkeyAt = 0;
     bool open = phonePairingLeft() > 0;
     bool ok = secure && (!fresh || open);
-    if (ok && fresh) {
-      addPhone(desc->peer_id_addr);
-      pairingUntil = 0;  // one phone per window
-    }
+    if (ok && fresh) pairingUntil = 0;  // one phone per window
     if (!ok) {
       refused++;
       lastRefusal = (desc->sec_state.encrypted ? 1 : 0) | (desc->sec_state.authenticated ? 2 : 0) | (fresh ? 4 : 0) | (open ? 8 : 0);
@@ -179,8 +147,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     portENTER_CRITICAL(&listMux);
     if (Link* l = linkFor(desc->conn_handle, true)) l->approved = true;
     portEXIT_CRITICAL(&listMux);
-    // 15-30 ms connection events (within Apple's limits) so taps reach the bridge quickly
-    server->updateConnParams(desc->conn_handle, 12, 24, 0, 400);
+    server->updateConnParams(desc->conn_handle, 12, 24, 0, 400);  // again, in case the first ask came too early
     pushState(true);
   }
 };
@@ -209,7 +176,7 @@ class StateCallbacks : public NimBLECharacteristicCallbacks {
 // ---------------------------------------------------------------------------------------------
 
 void phoneBegin() {
-  loadPhones();
+  loadPin();
   pinMode(BOOT_BUTTON, INPUT_PULLUP);
 
   NimBLEDevice::init(WL_BLE_NAME);
@@ -221,6 +188,7 @@ void phoneBegin() {
 
   server = NimBLEDevice::createServer();
   server->setCallbacks(new ServerCallbacks());
+  server->advertiseOnDisconnect(false);  // ours: onDisconnect advertises fast
   NimBLEService* svc = server->createService(SVC_UUID);
   NimBLECharacteristic* cmd = svc->createCharacteristic(
       CMD_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::WRITE_ENC | NIMBLE_PROPERTY::WRITE_AUTHEN, 512);
@@ -233,10 +201,9 @@ void phoneBegin() {
 
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   adv->addServiceUUID(SVC_UUID);
-  adv->setScanResponse(true);
-  adv->setMinInterval(244);  // 152.5-211 ms: quick to find, leaves the radio to Wi-Fi most of the time
-  adv->setMaxInterval(338);
-  adv->start();
+  adv->setScanResponse(true);  // the name, for the phone's device list
+  fastAdvUntil = millis() + ADV_FAST_MS;
+  advertise(true);
 }
 
 void phoneLoop() {
@@ -271,9 +238,14 @@ void phoneLoop() {
     for (auto& l : links)
       if (l.handle != 0xFFFF && std::find(peers.begin(), peers.end(), l.handle) == peers.end()) l = Link();  // gone
     portEXIT_CRITICAL(&listMux);
+    bool fast = fastAdvUntil && (int32_t)(millis() - fastAdvUntil) < 0;
+    if (fastAdvUntil && !fast) {  // no phone came back quickly: slow down
+      fastAdvUntil = 0;
+      if (NimBLEDevice::getAdvertising()->isAdvertising()) advertise(false);
+    }
     if ((int)peers.size() < MAX_CONN && !NimBLEDevice::getAdvertising()->isAdvertising()) {
       advRestarts++;
-      NimBLEDevice::startAdvertising();
+      advertise(fast);
     }
   }
 }
@@ -283,10 +255,6 @@ void phoneEnd() { NimBLEDevice::deinit(true); }
 void phoneOpenPairing(uint16_t seconds) { pairingUntil = millis() + seconds * 1000UL; }
 
 void phoneForget() {
-  portENTER_CRITICAL(&listMux);
-  numPhones = 0;
-  portEXIT_CRITICAL(&listMux);
-  savePhones();
   NimBLEDevice::deleteAllBonds();
   if (server)
     for (uint16_t id : server->getPeerDevices()) server->disconnect(id);
@@ -313,7 +281,7 @@ int phoneDiag(char* out, size_t cap) {
   return snprintf(out, cap, "c%d a%d r%lu x%lu/%u b%d", conns, adv ? 1 : 0, (unsigned long)advRestarts, (unsigned long)refused,
                   lastRefusal, NimBLEDevice::getNumBonds());
 }
-int phoneCount() { return server ? NimBLEDevice::getNumBonds() : numPhones; }  // the pairings are what counts (once Bluetooth runs)
+int phoneCount() { return server ? NimBLEDevice::getNumBonds() : 0; }  // (NimBLE can only be asked once it runs)
 
 int phonePairingLeft() {
   uint32_t until = pairingUntil;

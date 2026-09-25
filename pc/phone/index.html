@@ -34,6 +34,7 @@ main { max-width: 480px; margin: 0 auto; padding: max(18px, env(safe-area-inset-
 .top h1 { margin: 0; font: 700 32px/1 var(--display); letter-spacing: -.02em; }
 .pill { display: inline-flex; align-items: center; gap: 7px; height: 30px; padding: 0 12px; border-radius: 999px; background: var(--surface); border: 1px solid var(--line); font-size: 14px; color: var(--muted); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
+.pill.tap { cursor: pointer; }
 .pill.good .dot { background: var(--good); } .pill.warn .dot { background: var(--warn); } .pill.bad .dot { background: var(--bad); }
 
 .hero { border-radius: 28px; background: var(--surface); border: 1px solid var(--line); padding: 20px; margin-bottom: 16px; }
@@ -152,7 +153,12 @@ const $ = (id) => document.getElementById(id);
 // PC Sync: "live": false restarts WLED's live session, which blanks the strip first, so LEDs that
 // SignalRGB doesn't cover go dark instead of keeping the old colour (see SYNC_STATE in wledlink.py).
 const SYNC = {on: true, lor: 0, live: false, seg: {fx: 0, col: [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]}};
-let device = null, cmdChr = null, stateChr = null, state = {}, wantConnected = false, linkState = "idle";
+let device = null, cmdChr = null, stateChr = null, wantConnected = false, linkState = "idle";
+let retries = 0, retryTimer = null, lastError = "", pickerTried = false, hadLink = false;
+// the light's last known state: a light used before shows its controls while the link comes up
+let state = (() => { try { return JSON.parse(localStorage.getItem("wl-state")) || {}; } catch (e) { return {}; } })();
+// until the browser says which light it remembers (a moment after the page opens)
+let lookingUp = !!(navigator.bluetooth && navigator.bluetooth.getDevices && state.on !== undefined);
 const hold = {};  // optimistic values shown until the light confirms: {field: {value, until}}
 
 // ---------- state ----------
@@ -161,7 +167,7 @@ function light() {
   for (const [k, h] of Object.entries(hold)) if (h.until > now) l[k] = h.value; else delete hold[k];
   return l;
 }
-function optimistic(values, ms = 1500) {
+function optimistic(values, ms = linkState === "ready" ? 1500 : 15000) {  // longer while a tap waits for the link
   const until = Date.now() + ms;
   for (const [k, v] of Object.entries(values)) hold[k] = {value: v, until};
   render();
@@ -178,21 +184,25 @@ function modeOf(l) {
 }
 function render() {
   const connected = linkState === "ready";
-  $("connectView").hidden = connected;
-  $("controlView").hidden = !connected;
-  const pill = $("pill"), retrying = !connected && wantConnected && device;
-  pill.className = "pill " + (connected ? (state.ws ? "good" : "warn") : linkState === "connecting" || retrying ? "warn" : "");
+  const remembered = lookingUp || !!(device && wantConnected);
+  const controls = connected || (remembered && state.on !== undefined);  // a light used before: controls at once
+  $("connectView").hidden = controls;
+  $("controlView").hidden = !controls;
+  const stuck = !connected && remembered && retries >= 3;  // several failed tries: the remembered light may be out of date
+  const pill = $("pill");
+  pill.className = "pill " + (connected ? (state.ws ? "good" : "warn") : remembered ? "warn" : "");
+  pill.classList.toggle("tap", !connected && !!device);
   $("pillText").textContent = connected ? (state.ws ? "Connected" : "Light offline")
-    : linkState === "connecting" ? "Connecting" : retrying ? "Reconnecting" : "Not connected";
+    : stuck ? "Tap to reconnect" : !remembered ? "Not connected" : hadLink || lastError ? "Reconnecting" : "Connecting";
   $("connect").disabled = linkState === "connecting";
   $("connect").textContent = linkState === "connecting" ? "Connecting…" : "Connect";
-  const stuck = retrying && retries >= 4;  // ~10 s of failed tries: the remembered light may be out of date
-  $("connectTitle").textContent = stuck ? "Can't reach the light" : retrying ? "Reconnecting…" : "Connect to your light";
+  $("connectTitle").textContent = stuck ? "Can't reach the light" : !remembered ? "Connect to your light"
+    : hadLink || lastError ? "Reconnecting…" : "Connecting…";
   if (navigator.bluetooth) $("connectText").textContent = stuck
     ? "Still trying" + (lastError ? ` (${lastError})` : "") + ". If the bridge is on, tap Connect and pick Lamp."
-    : retrying ? "Looking for the light. It reconnects by itself as soon as the bridge is back."
+    : remembered ? "Looking for the light. It reconnects by itself as soon as the bridge is back."
     : "Your phone talks to the bridge over Bluetooth, so it stays on its normal Wi-Fi.";
-  if (!connected) { document.documentElement.style.setProperty("--level", 0); return; }
+  if (!controls) { document.documentElement.style.setProperty("--level", 0); return; }
 
   const l = light(), mode = modeOf(l);
   const on = mode !== "off" && mode !== "unknown";
@@ -226,18 +236,26 @@ function setSlider(p, text) {
 }
 
 // ---------- Bluetooth ----------
-let queue = null, writing = false;
-async function send(cmd) {
-  if (!cmdChr) return;
-  queue = Object.assign({tt: 0}, cmd);  // only the newest command matters if taps pile up
-  if (writing) return;
+// A light used before connects by itself when the page opens: its controls show at once with its last known
+// state, and whatever is tapped meanwhile goes out as soon as the link is ready.
+let queued = null, queuedAt = 0, writing = false;
+function send(cmd) {
+  queued = Object.assign({tt: 0}, cmd);  // only the newest command matters if taps pile up
+  queuedAt = Date.now();
+  flush();
+}
+async function flush() {
+  if (writing || linkState !== "ready") return;
   writing = true;
   try {
-    while (queue) {
-      const data = new TextEncoder().encode(JSON.stringify(queue));
-      queue = null;
-      if (cmdChr.writeValueWithoutResponse) await cmdChr.writeValueWithoutResponse(data);  // fastest: no round trip
-      else await cmdChr.writeValue(data);
+    while (queued && cmdChr) {
+      if (Date.now() - queuedAt > 15000) { queued = null; break; }  // tapped a while ago, while the light was away
+      const data = new TextEncoder().encode(JSON.stringify(queued));
+      queued = null;
+      // without a response: no round trip
+      await (cmdChr.writeValueWithoutResponse ? cmdChr.writeValueWithoutResponse(data) : cmdChr.writeValue(data));
+      const soon = Date.now() + 1500;  // what was shown for it waits for the light's answer from now on
+      for (const h of Object.values(hold)) h.until = Math.min(h.until, soon);
     }
   } catch (e) {
     toast("Couldn't reach the light");
@@ -247,6 +265,7 @@ async function send(cmd) {
 }
 function onState(value) {
   try { state = JSON.parse(new TextDecoder().decode(value)); } catch (e) { return; }
+  try { localStorage.setItem("wl-state", JSON.stringify(state)); } catch (e) {}
   render();
 }
 async function attach(dev) {
@@ -258,7 +277,7 @@ async function attach(dev) {
       cmdChr = stateChr = null;
       linkState = "idle";
       render();
-      if (wantConnected) setTimeout(() => reconnect(), 600);
+      if (wantConnected) retryTimer = setTimeout(reconnect, 150);
     });
   }
   linkState = "connecting";
@@ -268,71 +287,78 @@ async function attach(dev) {
   cmdChr = await svc.getCharacteristic(CMD);
   stateChr = await svc.getCharacteristic(STATE);
   stateChr.addEventListener("characteristicvaluechanged", (e) => onState(e.target.value));
-  onState(await stateChr.readValue());   // the first encrypted read is what makes iOS ask for the PIN
-  await stateChr.startNotifications();   // from now on the bridge pushes every change
+  await stateChr.startNotifications();  // from now on the bridge pushes every change
+  onState(await stateChr.readValue());  // encrypted: once this answers, the link is paired and ready
   linkState = "ready";
-  try { localStorage.setItem("wl-paired", "1"); } catch (e) {}
+  retries = 0;
+  lastError = "";
+  hadLink = true;
   render();
+  flush();  // what was tapped while connecting
 }
-// Keeps trying for as long as the page is open (the bridge may be off while the PC sleeps), backing off
-// to every 8 s; coming back to the page tries again at once.
-let retries = 0, retryTimer = null, lastError = "", pickerTried = false;
 const withTimeout = (p, ms) => Promise.race([p, new Promise((_, no) => setTimeout(() => no(new Error("timed out")), ms))]);
-// A light remembered from before only connects once the browser has seen it advertise again.
+// A light remembered from before only connects once the browser has heard it advertise again.
 async function heard(dev, ms) {
   if (!dev.watchAdvertisements) return;
   const seen = new Promise((ok) => dev.addEventListener("advertisementreceived", ok, {once: true}));
   try { await dev.watchAdvertisements(); } catch (e) { return; }
   try { await withTimeout(seen, ms); } catch (e) {} finally { try { dev.unwatchAdvertisements && dev.unwatchAdvertisements(); } catch (e) {} }
 }
+// Keeps trying for as long as the page is open (the bridge may be off while the PC sleeps), backing off to
+// every 8 s; coming back to the page tries again at once. If the remembered light won't answer, the device list
+// opens once by itself (one tap on Lamp), where the browser allows that without a tap.
 async function reconnect() {
   clearTimeout(retryTimer);
   if (!device || !wantConnected || linkState === "connecting" || device.gatt.connected) return;
   try {
     await heard(device, 4000);
     await withTimeout(attach(device), 10000);
-    retries = 0; lastError = "";
   } catch (e) {
     lastError = (e && (e.message || e.name)) || "no answer";
-    linkState = "idle"; render();
-    if (retries >= 1 && !pickerTried) { pickerTried = true; if (await pickAgain()) return; }
-    if (!document.hidden) retryTimer = setTimeout(reconnect, Math.min(8000, 800 * 2 ** Math.min(++retries, 4)));
+    linkState = "idle";
+    retries++;
+    render();
+    if (retries >= 2 && !pickerTried) {
+      pickerTried = true;
+      if (await pick(false)) return;
+    }
+    if (!document.hidden) retryTimer = setTimeout(reconnect, Math.min(8000, 800 * 2 ** Math.min(retries, 4)));
   }
 }
-// If the remembered light won't answer, offer the list straight away (one tap on Lamp), where the browser
-// allows that without a tap first; otherwise the Connect button does it.
-async function pickAgain() {
+// The device list. Connect always starts here: a remembered device can go out of date (the bridge forgot its
+// phones, or was reflashed), and then trying it again and again gets nowhere.
+async function pick(fromTap) {
+  if (linkState === "connecting") return false;
+  const had = device;
+  clearTimeout(retryTimer);
   try {
-    const dev = await navigator.bluetooth.requestDevice({filters: [{services: [SVC]}]});
-    device = dev;
-    await attach(dev);
-    retries = 0; lastError = "";
+    await attach(await navigator.bluetooth.requestDevice({filters: [{services: [SVC]}]}));
     return true;
   } catch (e) {
-    linkState = "idle"; render();
+    linkState = "idle";
+    render();
+    if (!fromTap) return false;
+    if (e && e.name !== "NotFoundError") {  // NotFoundError: the list was closed
+      const msg = e.message || e.name || "";
+      toast(/security|auth|insufficient|encrypt|pair/i.test(msg)
+        ? "Pairing didn't work. On the iPhone, remove \"Lamp\" in Settings > Bluetooth, press Pair a phone on the PC, then Connect again."
+        : `Couldn't connect (${msg || "no answer"}). If it keeps happening, remove "Lamp" in iPhone Settings > Bluetooth and pair again.`);
+    }
+    if (had && wantConnected) retryTimer = setTimeout(reconnect, 1000);  // keep trying the light it had
     return false;
   }
 }
-$("connect").addEventListener("click", async () => {
-  if (!navigator.bluetooth) { toast("This browser has no Bluetooth. On iPhone, open this page in Bluefy."); return; }
-  // Always through the device picker: a remembered device can go stale (the bridge forgot its phones, or
-  // was reflashed), and then trying it again and again gets nowhere.
-  clearTimeout(retryTimer);
-  wantConnected = false;
-  if (device && device.gatt.connected) device.gatt.disconnect();
-  device = null;
-  try {
-    await attach(await navigator.bluetooth.requestDevice({filters: [{services: [SVC]}]}));
-  } catch (e) {
-    linkState = "idle"; render();
-    if (e && e.name === "NotFoundError") return;  // picker closed
-    const msg = (e && (e.message || e.name)) || "";
-    toast(/security|auth|insufficient|encrypt|pair/i.test(msg)
-      ? "Pairing didn't work. On the iPhone, remove \"Lamp\" in Settings > Bluetooth, press Pair a phone on the PC, then Connect again."
-      : `Couldn't connect (${msg || "no answer"}). If it keeps happening, remove "Lamp" in iPhone Settings > Bluetooth and pair again.`);
-  }
+$("connect").addEventListener("click", () => {
+  if (navigator.bluetooth) pick(true);
+  else toast("This browser has no Bluetooth. On iPhone, open this page in Bluefy.");
 });
-$("disconnect").addEventListener("click", () => { wantConnected = false; if (device && device.gatt.connected) device.gatt.disconnect(); });
+$("pill").addEventListener("click", () => { if (linkState !== "ready" && device) pick(true); });
+$("disconnect").addEventListener("click", () => {
+  wantConnected = false;
+  clearTimeout(retryTimer);
+  if (device && device.gatt.connected) device.gatt.disconnect();
+  render();
+});
 document.addEventListener("visibilitychange", () => { if (!document.hidden && device && !device.gatt.connected && wantConnected) { retries = 0; reconnect(); } });
 
 // ---------- controls ----------
@@ -379,8 +405,10 @@ function toast(text) {
 if (navigator.bluetooth && navigator.bluetooth.getDevices) {
   navigator.bluetooth.getDevices().then((devs) => {
     const dev = devs.find((d) => d.name === "Lamp") || devs[0];
+    lookingUp = false;
     if (dev) { device = dev; wantConnected = true; reconnect(); }
-  }).catch(() => {});
+    render();
+  }).catch(() => { lookingUp = false; render(); });
 }
 if (!navigator.bluetooth) $("connectText").textContent = "This browser can't use Bluetooth. On iPhone, open this page in the Bluefy app.";
 render();

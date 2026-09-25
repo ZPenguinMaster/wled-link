@@ -119,7 +119,7 @@ index 308c939..1ff5024 100644
        DEBUG_PRINTF_P(PSTR("Last reconnect (%lus) too old (@ %lus).\n"), lastReconnectAttempt/1000, nowS);
        if (++selectedWiFi >= multiWiFi.size()) selectedWiFi = 0; // we couldn't connect, try with another network from the list
 diff --git a/wled00/wled.h b/wled00/wled.h
-index 7f264a2..b8f1e01 100644
+index 7f264a2..f6faff6 100644
 --- a/wled00/wled.h
 +++ b/wled00/wled.h
 @@ -7,7 +7,7 @@
@@ -127,7 +127,7 @@ index 7f264a2..b8f1e01 100644
  
  // version code in format yymmddb (b = daily build)
 -#define VERSION 2605010
-+#define VERSION 2606309  // WLED Link build of 16.0.1 (official release: 2606300)
++#define VERSION 2606310  // WLED Link build of 16.0.1 (official release: 2606300)
  
  //uncomment this if you have a "my_config.h" file you'd like to use
  //#define WLED_USE_MY_CONFIG

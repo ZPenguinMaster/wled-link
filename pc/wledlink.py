@@ -961,7 +961,10 @@ class Bridge:
         self._free.append(cid)
         self._slots_changed.set()
 
-    async def open_tcp(self, ip: str, port: int, timeout: float = 8.0) -> TunnelConn:
+    async def open_tcp(self, ip: str, port: int, timeout: float = 8.0, first: bytes = b"") -> TunnelConn:
+        """A connection through the bridge. `first` (an HTTP request, say) goes out right behind the open instead
+        of after its answer, which saves a round trip over the link: the bridge, or WLED's usermod over ESP-NOW,
+        holds it until the connection is up."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while self.state != "ready" or not self._free:
@@ -976,6 +979,9 @@ class Bridge:
         self.conns[cid] = conn
         self.send(H_TCP_OPEN, bytes([cid]) + socket.inet_aton(ip) + struct.pack(">H", port))
         try:
+            if first:
+                with contextlib.suppress(ConnectionResetError):  # a failed open says why just below
+                    await asyncio.wait_for(conn.write(first), max(0.5, deadline - loop.time()))
             await asyncio.wait_for(asyncio.shield(conn.opened), max(0.5, deadline - loop.time()))
         except asyncio.TimeoutError:
             conn.close()
@@ -983,12 +989,11 @@ class Bridge:
         return conn
 
     async def http_request(self, ip: str, method: str, path: str, body: bytes | None = None, timeout: float = 6.0):
-        conn = await self.open_tcp(ip, 80, timeout)
+        lines = [f"{method} {path} HTTP/1.1", f"Host: {ip}", "Connection: close", "Accept: application/json"]
+        if body is not None:
+            lines += ["Content-Type: application/json", f"Content-Length: {len(body)}"]
+        conn = await self.open_tcp(ip, 80, timeout, first=("\r\n".join(lines) + "\r\n\r\n").encode() + (body or b""))
         try:
-            lines = [f"{method} {path} HTTP/1.1", f"Host: {ip}", "Connection: close", "Accept: application/json"]
-            if body is not None:
-                lines += ["Content-Type: application/json", f"Content-Length: {len(body)}"]
-            await conn.write(("\r\n".join(lines) + "\r\n\r\n").encode() + (body or b""))
             status_line, _, content = await read_http_response(conn, timeout)
             parts = status_line.split(" ")
             if len(parts) < 2 or not parts[1].isdigit():
@@ -1628,18 +1633,16 @@ class HttpFront:
         target = self.bridge.target
         if self.bridge.state != "ready" or not target:
             return await self._unavailable(req, writer, self._why_unavailable())
-        try:
-            conn = await self.bridge.open_tcp(target["ip"], 80)
-        except Exception as exc:
-            self.bridge.request_resolve()
-            return await self._unavailable(req, writer, f"Could not reach WLED through the bridge: {exc}")
-
         # One request per connection (websockets aside), so every request passes through here
         # and none of the /json responses can slip past the rewrite on a reused connection.
         upgrade = "upgrade" in req.header("connection").lower()
         rewrite = req.method in ("GET", "POST") and req.path.rstrip("/") in REWRITE_PATHS
         try:
-            await conn.write(head if upgrade else req.head_bytes(close=True))
+            conn = await self.bridge.open_tcp(target["ip"], 80, first=head if upgrade else req.head_bytes(close=True))
+        except Exception as exc:
+            self.bridge.request_resolve()
+            return await self._unavailable(req, writer, f"Could not reach WLED through the bridge: {exc}")
+        try:
             upstream = asyncio.create_task(self._pump_up(reader, conn))
             try:
                 if rewrite:
