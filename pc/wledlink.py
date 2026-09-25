@@ -1230,7 +1230,8 @@ class Bridge:
             s = target["settings"]
         lc = (target["info"].get("leds") or {}).get("lc", 7)  # capability bits: 1 RGB, 2 white, 4 CCT
         notes = []
-        if not lc & 0x02:
+        leds = target["info"].get("leds") or {}
+        if not lc & 0x02 and not leds.get("rgbw") and not lc & 0x04:
             col = [255, 255, 255, 0]
             notes.append("WLED reports no white channel for this strip, so this white is mixed from RGB.")
         elif s.get("autoWhite", 0) in (0, 3):   # None / Dual: the white value is used as given

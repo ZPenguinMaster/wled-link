@@ -308,7 +308,8 @@ document.querySelectorAll(".tile").forEach((t) => t.addEventListener("click", ()
   if (m === "sync") { optimistic({on: 1, lor: 0, live: 1, fx: 0, col: [0, 0, 0, 0]}); send(SYNC); return; }
   const cct = {neutral: 127, cool: 255, warm: 0}[m];
   optimistic({on: 1, bri: 255, lor: 2, ps: -1, fx: 0, cct, col: [0, 0, 0, 255]});
-  send({on: true, bri: 255, lor: 2, seg: {fx: 0, col: [[0, 0, 0, 255], [0, 0, 0, 0], [0, 0, 0, 0]], cct}});
+  // the light's WLED Link code picks the white that suits the strip's auto-white setting
+  send({on: true, bri: 255, lor: 2, seg: {fx: 0, col: [[0, 0, 0, 255], [0, 0, 0, 0], [0, 0, 0, 0]], cct}, WLEDLink: {white: true}});
 }));
 (function () {
   const el = $("bri");

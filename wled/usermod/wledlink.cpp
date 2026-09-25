@@ -377,6 +377,23 @@ bool handleCmd(const uint8_t* json, size_t len) {
   return true;
 }
 
+// "White" in whatever form this strip's auto-white setting turns into the white LEDs alone (the phone can't
+// know it; the PC page reads it from WLED's settings): Accurate makes white from full RGB and turns the RGB
+// off, None and Dual use the white value as given, Brighter and Max only add white to RGB.
+uint32_t fullWhite() {
+  uint8_t aw = Bus::getGlobalAWMode();
+  if (aw == AW_GLOBAL_DISABLED) {
+    Bus* bus = BusManager::getBus(0);
+    aw = bus ? bus->getAutoWhiteMode() : RGBW_MODE_MANUAL_ONLY;
+  }
+  switch (aw) {
+    case RGBW_MODE_AUTO_ACCURATE: return RGBW32(255, 255, 255, 0);
+    case RGBW_MODE_AUTO_BRIGHTER:
+    case RGBW_MODE_MAX: return RGBW32(255, 255, 255, 255);
+    default: return RGBW32(0, 0, 0, 255);
+  }
+}
+
 void pushState() {
   Segment& seg = strip.getMainSegment();
   uint32_t c = seg.colors[0];
@@ -619,10 +636,21 @@ class WledLinkUsermod : public Usermod {
     else row.add(wlink.up() ? F("Wi-Fi, linked") : F("Wi-Fi"));
   }
 
-  // {"WLEDLink": {"key": "32 hex digits", "ch": 1-13, "mode": "espnow"|"wifi", "restore": true}}
+  // {"WLEDLink": {"key": "32 hex digits", "ch": 1-13, "mode": "espnow"|"wifi", "restore": true, "white": true}}
   void readFromJsonState(JsonObject& root) override {
     JsonObject w = root[F("WLEDLink")];
     if (w.isNull()) return;
+    if (w[F("white")] | false) {  // after WLED applied the rest of the command: the selected segments go full white
+      uint32_t c = fullWhite();
+      strip.suspend();
+      strip.waitForIt();
+      for (size_t i = 0; i < strip.getSegmentsNum(); i++) {
+        Segment& seg = strip.getSegment(i);
+        if (seg.isActive() && seg.isSelected()) seg.setColor(0, c);
+      }
+      strip.resume();
+      stateDirty = true;
+    }
     bool changed = false;
     const char* k = w[F("key")];
     uint8_t key[16];
