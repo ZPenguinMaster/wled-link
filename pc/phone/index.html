@@ -189,7 +189,7 @@ function render() {
   const stuck = retrying && retries >= 4;  // ~10 s of failed tries: the remembered light may be out of date
   $("connectTitle").textContent = stuck ? "Can't reach the light" : retrying ? "Reconnecting…" : "Connect to your light";
   if (navigator.bluetooth) $("connectText").textContent = stuck
-    ? "Still trying. If the bridge is on, tap Connect and pick Lamp again (after Forget phones on the PC, also remove Lamp in iPhone Settings > Bluetooth)."
+    ? "Still trying" + (lastError ? ` (${lastError})` : "") + ". If the bridge is on, tap Connect and pick Lamp."
     : retrying ? "Looking for the light. It reconnects by itself as soon as the bridge is back."
     : "Your phone talks to the bridge over Bluetooth, so it stays on its normal Wi-Fi.";
   if (!connected) { document.documentElement.style.setProperty("--level", 0); return; }
@@ -276,14 +276,41 @@ async function attach(dev) {
 }
 // Keeps trying for as long as the page is open (the bridge may be off while the PC sleeps), backing off
 // to every 8 s; coming back to the page tries again at once.
-let retries = 0, retryTimer = null;
+let retries = 0, retryTimer = null, lastError = "", pickerTried = false;
+const withTimeout = (p, ms) => Promise.race([p, new Promise((_, no) => setTimeout(() => no(new Error("timed out")), ms))]);
+// A light remembered from before only connects once the browser has seen it advertise again.
+async function heard(dev, ms) {
+  if (!dev.watchAdvertisements) return;
+  const seen = new Promise((ok) => dev.addEventListener("advertisementreceived", ok, {once: true}));
+  try { await dev.watchAdvertisements(); } catch (e) { return; }
+  try { await withTimeout(seen, ms); } catch (e) {} finally { try { dev.unwatchAdvertisements && dev.unwatchAdvertisements(); } catch (e) {} }
+}
 async function reconnect() {
   clearTimeout(retryTimer);
   if (!device || !wantConnected || linkState === "connecting" || device.gatt.connected) return;
-  try { await attach(device); retries = 0; }
-  catch (e) {
+  try {
+    await heard(device, 4000);
+    await withTimeout(attach(device), 10000);
+    retries = 0; lastError = "";
+  } catch (e) {
+    lastError = (e && (e.message || e.name)) || "no answer";
     linkState = "idle"; render();
+    if (retries >= 1 && !pickerTried) { pickerTried = true; if (await pickAgain()) return; }
     if (!document.hidden) retryTimer = setTimeout(reconnect, Math.min(8000, 800 * 2 ** Math.min(++retries, 4)));
+  }
+}
+// If the remembered light won't answer, offer the list straight away (one tap on Lamp), where the browser
+// allows that without a tap first; otherwise the Connect button does it.
+async function pickAgain() {
+  try {
+    const dev = await navigator.bluetooth.requestDevice({filters: [{services: [SVC]}]});
+    device = dev;
+    await attach(dev);
+    retries = 0; lastError = "";
+    return true;
+  } catch (e) {
+    linkState = "idle"; render();
+    return false;
   }
 }
 $("connect").addEventListener("click", async () => {
