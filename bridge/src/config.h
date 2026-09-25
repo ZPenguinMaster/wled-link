@@ -4,7 +4,7 @@
 // like any home Wi-Fi. These can also be changed later without reflashing:
 //   python pc\wledlink.py bridge-config --ssid ... --password ...
 #define WL_DEFAULT_SSID          "WLEDLink"
-#define WL_DEFAULT_PASS          "quartz-basil-1769"
+#define WL_DEFAULT_PASS          ""    // empty: each bridge makes up its own on first start (shown on the control page)
 #define WL_DEFAULT_CHANNEL       0     // 0 = pick the least crowded of 1/6/11 at every boot
 #define WL_DEFAULT_HIDDEN        1     // don't show up in phones' Wi-Fi lists; WLED must be given the name directly
 #define WL_DEFAULT_TXPOWER_QDBM  34    // 8.5 dBm (units of 0.25 dBm): enough for one room, little spill-over

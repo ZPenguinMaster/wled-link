@@ -10,7 +10,9 @@ static std::deque<Air> toB, toA;
 static const uint8_t macA[6] = {0x02, 0, 0, 0, 0, 0xA1}, macB[6] = {0x02, 0, 0, 0, 0, 0xB2};
 static wll::Link A, B;
 static uint32_t lossPct = 0, busyPct = 0;
-static std::vector<uint8_t> lastSealedToB;
+static std::vector<uint8_t> lastSealedToB, lastHelloFromA;
+static uint32_t announced = 0;
+static uint8_t annMode = 0xFF, annCh = 0;
 static uint32_t dgB = 0, dgBad = 0, refusePct = 0;
 static int passed = 0, failed = 0;
 
@@ -19,6 +21,7 @@ static bool coin(uint32_t pct) { return pct && (esp_random() % 100) < pct; }
 static bool sendA(const uint8_t* mac, const uint8_t* f, size_t n) {
   if (coin(busyPct)) return false;
   if (f[1] == wll::F_SEALED) lastSealedToB.assign(f, f + n);
+  if (f[1] == wll::F_HELLO) lastHelloFromA.assign(f, f + n);
   if (!coin(lossPct)) { Air a; memcpy(a.from, macA, 6); a.f.assign(f, f + n); toB.push_back(a); }
   return true;
 }
@@ -113,9 +116,13 @@ void setup() {
   for (int i = 0; i < 16; i++) key[i] = i * 17 + 3;
   A.send = sendA; A.deliver = deliverA; A.begin(true, 16384); A.setKey(key);
   B.send = sendB; B.deliver = deliverB; B.begin(false, 8192); B.setKey(key);
+  B.onHello = [](uint8_t m, uint8_t c) { announced++; annMode = m; annCh = c; };
+  A.setAnnounce(wll::MODE_ESPNOW, 6);
 
   step(1200);
   check("handshake", A.up() && B.up());
+  check("the light takes the bridge's mode and channel once the session is confirmed",
+        announced == 1 && annMode == wll::MODE_ESPNOW && annCh == 6);
 
   uint32_t t0 = millis();
   check("200 messages each way, intact and in order (clean air)", transfer(200, 200000));
@@ -140,6 +147,15 @@ void setup() {
   }
   step(20);
   check("datagrams (two fragments each) arrive intact", dgB == 50 && dgBad == 0);
+  dgB = dgBad = 0;
+  for (int i = 0; i < 20; i++) {
+    uint8_t d[245];
+    for (int k = 0; k < 245; k++) d[k] = (uint8_t)((k + 1) * 7 + i);
+    A.sendDatagram2((uint8_t)i, d, sizeof d);  // type byte in front, no copy
+    step(3);
+  }
+  step(20);
+  check("datagrams with a type byte arrive intact", dgB == 20 && dgBad == 0);
 
   // replay: the last sealed frame A sent goes on the air again
   gotBCount = 0;
@@ -175,9 +191,34 @@ void setup() {
   step(20);
   check("a device with another key can't start a session", A.up() && B.up() && gotBCount == beforeC);
 
+  // a recorded HELLO (announcing something else) played back to a working link changes nothing
+  uint32_t upsB = B.stats.ups, annBefore = announced;
+  A.setAnnounce(wll::MODE_WIFI, 11);
+  A.helloNow(now);  // goes on the air, and is recorded
+  step(50);
+  std::vector<uint8_t> hello = lastHelloFromA;
+  for (int i = 0; i < 3; i++) B.onFrame(macA, hello.data(), hello.size(), now);
+  step(50);
+  check("a HELLO played back to a working link is ignored", A.up() && B.up() && B.stats.ups == upsB && announced == annBefore);
+  check("traffic keeps flowing meanwhile", transfer(20, 50000));
+
+  // the bridge goes quiet, and while the light has no session the recording plays again
+  lossPct = 100;
+  step(wll::DEAD_MS + 200);
+  check("both ends notice the silence", !A.up() && !B.up());
+  B.onFrame(macA, hello.data(), hello.size(), now);
+  step(10);
+  check("a HELLO played back during an outage doesn't bring the light up", !B.up() && announced == annBefore);
+  step(wll::SHAKE_MS + 100);
+  check("the light gives up on it", !B.up() && !B.handshaking());
+  lossPct = 0;
+  step(3000);
+  check("the real bridge is back within seconds", A.up() && B.up());
+  check("and the light now follows what it announces", announced == annBefore + 1 && annMode == wll::MODE_WIFI && annCh == 11);
+
   // the bridge restarts: new session, traffic continues
   A.drop();
-  step(1500);
+  step(3000);
   check("reconnects after one end restarts", A.up() && B.up());
   check("works after reconnecting", transfer(50, 100000));
 

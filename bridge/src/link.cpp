@@ -1,6 +1,8 @@
 #include "link.h"
 
 #include <Preferences.h>
+#include <bootloader_random.h>
+#include <esp_bt.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
 
@@ -78,6 +80,17 @@ void down() { onLinkChange(false); }
 
 }  // namespace
 
+// The hardware RNG is only truly random while the radio runs; before that, borrow the bootloader's
+// entropy source (which must not run alongside Wi-Fi or Bluetooth).
+void randomBytes(void* out, size_t n) {
+  wifi_mode_t m = WIFI_MODE_NULL;
+  bool radio = (esp_wifi_get_mode(&m) == ESP_OK && m != WIFI_MODE_NULL) ||
+               esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED;
+  if (!radio) bootloader_random_enable();
+  esp_fill_random(out, n);
+  if (!radio) bootloader_random_disable();
+}
+
 void linkLoad() {
   Preferences p;
   if (p.begin("wllink", true)) {
@@ -90,7 +103,7 @@ void linkLoad() {
 
 void linkEnsureKey() {
   if (haveKey) return;
-  esp_fill_random(key, 16);  // the radio is on, so this is true randomness
+  randomBytes(key, 16);
   Preferences p;
   if (p.begin("wllink", false)) {
     haveKey = p.putBytes("key", key, 16) == 16;
@@ -215,11 +228,7 @@ bool linkPeerMac(uint8_t out[6]) {
 bool linkSendMsg(uint8_t type, const uint8_t* payload, size_t len) { return running && blink.sendMsg2(type, payload, len); }
 
 bool linkSendDatagram(uint8_t type, const uint8_t* payload, size_t len) {
-  if (!running || len + 1 > wll::MSG_MAX) return false;
-  uint8_t buf[wll::MSG_MAX];
-  buf[0] = type;
-  memcpy(buf + 1, payload, len);
-  return blink.sendDatagram(buf, len + 1);
+  return running && blink.sendDatagram2(type, payload, len);
 }
 
 uint32_t linkFramesSent() { return framesSent; }

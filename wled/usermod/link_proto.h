@@ -13,6 +13,9 @@
 // frame (encrypt-then-MAC); the counter only goes up, so a recorded frame can't be played back.
 // Inside a SEALED frame: DATA (reliable and in order: go-back-N with a window of 4), ACK, or DGRAM (best
 // effort, for LED colour data, which is useless if late).
+// WLED counts a session as up only once the bridge's first SEALED frame arrives: it is made with keys from
+// WLED's fresh nonce, so it can't be a recording. Only then does WLED follow the mode and channel the HELLO
+// named. And while a session works, WLED ignores HELLOs, so a recorded HELLO played back later can't break it.
 //
 // The owner calls onFrame() for every received packet and tick() often, from one task.
 
@@ -43,6 +46,8 @@ static const uint32_t RTO_MS = 40;             // resend unacknowledged DATA aft
 static const uint32_t KEEPALIVE_MS = 1000;     // something is sent at least this often while up
 static const uint32_t DEAD_MS = 4000;          // nothing valid heard for this long: the link is down
 static const uint32_t MAX_RESENDS = 60;        // ~2.5 s of resending without progress: down
+static const uint32_t HEALTHY_MS = 1500;       // WLED side: a session heard from this recently ignores HELLOs
+static const uint32_t SHAKE_MS = 3000;         // WLED side: a handshake the bridge doesn't confirm by then is dropped
 
 // HMAC-SHA256 over up to three pieces.
 inline void hmac(const uint8_t* key, size_t keyLen, const void* a, size_t alen, const void* b, size_t blen,
@@ -108,7 +113,7 @@ class Link {
   bool (*deliver)(const uint8_t* msg, size_t len, bool reliable) = nullptr;
   void (*onUp)() = nullptr;
   void (*onDown)() = nullptr;
-  void (*onHello)(uint8_t mode, uint8_t channel) = nullptr;  // WLED side: what the bridge announced
+  void (*onHello)(uint8_t mode, uint8_t channel) = nullptr;  // WLED side: what the bridge announced (once confirmed)
 
   // queueSize: bytes of reliable messages that can wait to be sent (the bridge needs room for every open
   // connection's window; WLED only reads its sockets while there is room).
@@ -135,23 +140,24 @@ class Link {
 
   // What happened so far, for diagnostics.
   struct Stats {
-    uint32_t helloTx, helloRx, helloBad, ackTx, ackRx, ackBad, ackStale, reqTx, reqRx, reqBad;
+    uint32_t helloTx, helloRx, helloBad, helloIgnored, ackTx, ackRx, ackBad, ackStale, reqTx, reqRx, reqBad;
     uint32_t sealedRx, sealedBad, sealedOld, sendFail, ups;
   };
   Stats stats = {};
 
-  // "h1/2/0 a3/4/0/1 r5/6/0 s7/0/0 f0 u1": hello tx/rx/bad, ack tx/rx/bad/stale, req tx/rx/bad,
+  // "h1/2/0/0 a3/4/0/1 r5/6/0 s7/0/0 f0 u1": hello tx/rx/bad/ignored, ack tx/rx/bad/stale, req tx/rx/bad,
   // sealed rx/bad/old, send failures, sessions
   int statsText(char* out, size_t cap) const {
-    return snprintf(out, cap, "h%lu/%lu/%lu a%lu/%lu/%lu/%lu r%lu/%lu/%lu s%lu/%lu/%lu f%lu u%lu",
+    return snprintf(out, cap, "h%lu/%lu/%lu/%lu a%lu/%lu/%lu/%lu r%lu/%lu/%lu s%lu/%lu/%lu f%lu u%lu",
                     (unsigned long)stats.helloTx, (unsigned long)stats.helloRx, (unsigned long)stats.helloBad,
-                    (unsigned long)stats.ackTx, (unsigned long)stats.ackRx, (unsigned long)stats.ackBad,
+                    (unsigned long)stats.helloIgnored, (unsigned long)stats.ackTx, (unsigned long)stats.ackRx, (unsigned long)stats.ackBad,
                     (unsigned long)stats.ackStale, (unsigned long)stats.reqTx, (unsigned long)stats.reqRx,
                     (unsigned long)stats.reqBad, (unsigned long)stats.sealedRx, (unsigned long)stats.sealedBad,
                     (unsigned long)stats.sealedOld, (unsigned long)stats.sendFail, (unsigned long)stats.ups);
   }
 
   bool up() const { return isUp; }
+  bool handshaking() const { return shaking; }  // WLED side: answered a HELLO, waiting for the bridge to confirm
   const uint8_t* peer() const { return peerMac; }
   bool hasPeer() const { return havePeer; }
   uint32_t lastHeard() const { return lastRx; }
@@ -176,22 +182,8 @@ class Link {
   }
 
   // Best effort, unordered with respect to sendMsg; dropped if the radio is busy.
-  bool sendDatagram(const uint8_t* msg, size_t len) {
-    if (!isUp || len == 0 || len > MSG_MAX) return false;
-    uint8_t count = (uint8_t)((len + FRAG_MAX - 1) / FRAG_MAX);
-    uint8_t id = ++dgTxId;
-    uint8_t plain[PLAIN_MAX];
-    for (uint8_t i = 0; i < count; i++) {
-      size_t off = (size_t)i * FRAG_MAX, n = len - off < FRAG_MAX ? len - off : FRAG_MAX;
-      plain[0] = K_DGRAM;
-      plain[1] = id;
-      plain[2] = i;
-      plain[3] = count;
-      memcpy(plain + 4, msg + off, n);
-      if (!sendSealed(plain, n + 4)) return false;
-    }
-    return true;
-  }
+  bool sendDatagram(const uint8_t* msg, size_t len) { return sendDgram(msg, len, nullptr, 0); }
+  bool sendDatagram2(uint8_t type, const uint8_t* payload, size_t len) { return sendDgram(&type, 1, payload, len); }
 
   void onFrame(const uint8_t mac[6], const uint8_t* f, size_t len, uint32_t now) {
     millisNow = now;
@@ -213,6 +205,8 @@ class Link {
       if (isBridge) {
         uint32_t every = now - downSince < 30000 ? 500 : 2000;  // eager at first, then relaxed
         if (now - lastHello >= every) sendHello(now);
+      } else if (shaking) {
+        if (now - shakeSince > SHAKE_MS) shaking = false;  // never confirmed: ask again
       } else if (now - lastHello >= 1000) {
         sendHelloReq(now);
       }
@@ -243,7 +237,9 @@ class Link {
   uint32_t txCtr = 0, rxCtr = 0;
   uint32_t lastRx = 0, lastTx = 0, lastHello = 0, lastHelloReqSeen = 0, downSince = 0;
   uint8_t helloAckCache[26];
-  bool helloAckValid = false;
+  bool shaking = false;  // WLED side: HELLO_ACK sent for bNonce/wNonce, the bridge hasn't confirmed yet
+  uint32_t shakeSince = 0;
+  uint8_t shakeMode = 0, shakeChannel = 0;  // what that HELLO announced
 
   // reliable send: queued bytes not yet cut into fragments, and fragments waiting for an ACK
   uint8_t* q = nullptr;
@@ -289,7 +285,7 @@ class Link {
   void goDown() {
     bool was = isUp;
     isUp = false;
-    helloAckValid = false;
+    shaking = false;
     reset();
     downSince = lastHello = 0;
     if (was && onDown) onDown();
@@ -350,25 +346,31 @@ class Link {
     tag("WLLH", f, 12, t);
     if (!equalCT(t, f + 12, TAG_LEN)) { stats.helloBad++; return; }
     stats.helloRx++;
-    if (onHello) onHello(f[2], f[3]);
-    if (isUp && havePeer && !memcmp(mac, peerMac, 6) && !memcmp(bNonce, f + 4, 8) && helloAckValid) {
-      if (send && !send(peerMac, helloAckCache, sizeof helloAckCache)) stats.sendFail++;  // our answer got lost: repeat it
+    // The bridge sends a HELLO when it has no session (or WLED asked for one), so while ours works it is a
+    // recording or a stray. After a real restart of the bridge ours stops working within HEALTHY_MS.
+    if (isUp && now - lastRx < HEALTHY_MS) { stats.helloIgnored++; return; }
+    if (shaking && !memcmp(mac, peerMac, 6) && !memcmp(bNonce, f + 4, 8)) {  // our answer got lost: repeat it
+      if (send && !send(peerMac, helloAckCache, sizeof helloAckCache)) stats.sendFail++;
       stats.ackTx++;
       return;
     }
+    if (isUp) goDown();  // the old session stopped working: this starts the next one
     memcpy(bNonce, f + 4, 8);
     esp_fill_random(wNonce, 8);
     memcpy(peerMac, mac, 6);
     havePeer = true;
     deriveKeys();
+    reset();
+    shaking = true;
+    shakeSince = now;
+    shakeMode = f[2];
+    shakeChannel = f[3];
     uint8_t* a = helloAckCache;
     a[0] = MAGIC;
     a[1] = F_HELLO_ACK;
     memcpy(a + 2, bNonce, 8);
     memcpy(a + 10, wNonce, 8);
     tag("WLLA", a, 18, a + 18);
-    helloAckValid = true;
-    goUp(now);
     if (send && !send(peerMac, a, sizeof helloAckCache)) stats.sendFail++;
     stats.ackTx++;
   }
@@ -420,13 +422,18 @@ class Link {
   }
 
   void rxSealed(const uint8_t mac[6], const uint8_t* f, size_t len, uint32_t now) {
-    if (!isUp || !havePeer || memcmp(mac, peerMac, 6) != 0 || len < SEAL_HDR + TAG_LEN + 1) return;
+    if (!(isUp || shaking) || !havePeer || memcmp(mac, peerMac, 6) != 0 || len < SEAL_HDR + TAG_LEN + 1) return;
     uint32_t ctr;
     memcpy(&ctr, f + 2, 4);
     if (ctr <= rxCtr) { stats.sealedOld++; return; }  // replayed or duplicated
     uint8_t h[32];
     hmac(rxKeys.mac, 32, f, len - TAG_LEN, nullptr, 0, nullptr, 0, h);
     if (!equalCT(h, f + len - TAG_LEN, TAG_LEN)) { stats.sealedBad++; return; }
+    if (shaking) {  // made with keys from our fresh nonce: the bridge is really there, right now
+      shaking = false;
+      goUp(now);
+      if (onHello) onHello(shakeMode, shakeChannel);
+    }
     stats.sealedRx++;
     rxCtr = ctr;
     lastRx = now;
@@ -498,6 +505,28 @@ class Link {
       dgActive = false;
       if (deliver) deliver(dgBuf, dgLen, false);
     }
+  }
+
+  // Datagram of head | body, cut into as many frames as it takes (usually one or two).
+  bool sendDgram(const uint8_t* head, size_t headLen, const uint8_t* body, size_t bodyLen) {
+    size_t total = headLen + bodyLen;
+    if (!isUp || total == 0 || total > MSG_MAX) return false;
+    uint8_t count = (uint8_t)((total + FRAG_MAX - 1) / FRAG_MAX);
+    uint8_t id = ++dgTxId;
+    uint8_t plain[PLAIN_MAX];
+    for (uint8_t i = 0; i < count; i++) {
+      size_t off = (size_t)i * FRAG_MAX, n = total - off < FRAG_MAX ? total - off : FRAG_MAX;
+      plain[0] = K_DGRAM;
+      plain[1] = id;
+      plain[2] = i;
+      plain[3] = count;
+      for (size_t k = 0; k < n; k++) {
+        size_t at = off + k;
+        plain[4 + k] = at < headLen ? head[at] : body[at - headLen];
+      }
+      if (!sendSealed(plain, n + 4)) return false;
+    }
+    return true;
   }
 
   bool transmit(const Pending& p) {

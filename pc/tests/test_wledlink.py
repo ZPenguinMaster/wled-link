@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import socket
 import subprocess
 import sys
@@ -335,6 +336,9 @@ async def e2e():
         code, _, body = await ahttp("POST", "/__wledlink/api/bridge-config",
                                     json.dumps({"ssid": "NewNet", "password": "longenough1", "channel": 6}).encode())
         check("bridge-config reaches the bridge", code == 200 and json.loads(body).get("ok") and bridge.config_payloads[-1] == payload)
+        check("WLED gets the new Wi-Fi name and password first, so nothing has to be typed into it",
+              wled.wifi == ("NewNet", "longenough1") and any("WLED has the new" in n for n in json.loads(body).get("notes", [])),
+              (wled.wifi, body))
         check("still works after the config reboot", await wait_for(json_info_ok, 10, "recovery after config"))
 
         print("ESP-NOW link")
@@ -355,6 +359,15 @@ async def e2e():
         check("then switches to ESP-NOW by itself (the default)", await until(lambda: bridge.link_mode == "espnow", 15),
               bridge.link_requests)
         check("status shows the ESP-NOW link", await wait_for(lambda: _link_mode_is("espnow"), 10, "link status"))
+        bridge.password = "made-up-by-it"  # as if the bridge had been reset and made up its own password
+        bridge.reboot()
+        check("a password the bridge made up reaches the light over ESP-NOW",
+              await until(lambda: wled.wifi == (bridge.ssid, "made-up-by-it"), 20), wled.wifi)
+        rc = await cli("bridge-config", "--new-password")
+        check("'bridge-config --new-password' makes one up and gives it to both",
+              rc.returncode == 0 and bridge.password not in ("", "made-up-by-it") and wled.wifi == (bridge.ssid, bridge.password)
+              and re.fullmatch(r"[a-z2-9]{4}-[a-z2-9]{4}-[a-z2-9]{4}", bridge.password), (rc.stdout + rc.stderr, bridge.password))
+        check("still linked after that", await wait_for(lambda: _link_mode_is("espnow"), 15, "link status"))
         code, _, body = await ahttp("POST", "/__wledlink/api/link", json.dumps({"mode": "wifi"}).encode())
         check("the toggle switches back to Wi-Fi", code == 200 and await until(lambda: bridge.link_mode == "wifi", 10), body)
         rc = await cli("link")

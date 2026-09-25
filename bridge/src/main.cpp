@@ -111,6 +111,22 @@ static void loadSettings() {
   if (ok) p.end();
   strlcpy(settings.ssid, ssid.c_str(), sizeof settings.ssid);
   strlcpy(settings.pass, pass.c_str(), sizeof settings.pass);
+  if (!settings.pass[0]) {  // none set (config.h leaves it empty on purpose): make one up, once, and keep it
+    static const char alphabet[] = "abcdefghjkmnpqrstuvwxyz23456789";  // nothing that reads as something else
+    uint8_t r[12];
+    randomBytes(r, sizeof r);
+    char* o = settings.pass;
+    for (int i = 0; i < 12; i++) {
+      if (i && i % 4 == 0) *o++ = '-';
+      *o++ = alphabet[r[i] % (sizeof alphabet - 1)];
+    }
+    *o = 0;
+    Preferences w;
+    if (w.begin("wledlink", false)) {
+      w.putString("pass", settings.pass);
+      w.end();
+    }
+  }
 }
 
 static bool saveSettings(const Settings& s) {
@@ -673,9 +689,9 @@ static void handleSetConfig(const uint8_t* p, size_t n) {
   for (const char* c = s.pass; *c; c++)
     if (*c < 0x20 || *c > 0x7E) return sendConfigResult(false, "password must be plain ASCII");
   if (s.channel > 11) return sendConfigResult(false, "channel must be 0 (auto) or 1-11");
-  if (s.channel == 0) linkForgetChannel();  // "auto": pick the quietest channel again at the next start
   if (s.txq < 8 || s.txq > 78) return sendConfigResult(false, "TX power must be 2-19.5 dBm");
   if (!saveSettings(s)) return sendConfigResult(false, "could not save settings");
+  if (s.channel == 0) linkForgetChannel();  // "auto": pick the quietest channel again at the next start
   sendConfigResult(true, "saved, rebooting");
   rebootAtMs = millis() + 300;
 }

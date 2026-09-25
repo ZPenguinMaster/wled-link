@@ -375,7 +375,9 @@ static void applyCommand(const Cmd& cmd) {
 // through this bridge, so the bridge can tell by itself.
 static void trackStream() {
   uint32_t at = lastStreamMs;
-  int live = at && millis() - at < STREAM_TIMEOUT_MS ? 1 : 0;
+  // signed: a packet noted in this very millisecond can be 1 ms "ahead" (see wledNoteStream), and unsigned
+  // that read as 49 days ago, so the pages flashed "WLED effect" for a moment every few seconds
+  int live = at && (int32_t)(millis() - at) < (int32_t)STREAM_TIMEOUT_MS ? 1 : 0;
   if (live == state.live) return;  // only this task changes the state, so no lock needed to read it
   State s = snapshot();
   s.live = live;

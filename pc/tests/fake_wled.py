@@ -29,7 +29,9 @@ class FakeWled:
             "light": {"scale-bri": 100, "pal-mode": 0, "aseg": False, "gc": {"bri": 1, "col": 2.8, "val": 2.8},
                       "tr": {"mode": True, "dur": 7, "pal": 0, "rpc": 5}, "nl": {"mode": 1, "dur": 60, "tbri": 0, "macro": 0}},
             "ap": {"ssid": "WLED-AP", "pskl": 8, "chan": 1, "hide": 0, "behav": 0, "ip": [4, 3, 2, 1]},
+            "nw": {"ins": [{"ssid": "WLEDLink", "pskl": 14, "ip": [0, 0, 0, 0]}]},
         }
+        self.wifi = ("WLEDLink", "fake-pass-0000")  # what it would join
         self.cfg_locked = False  # behaves like a settings PIN is set
         self.cfg_posts = []
         self.bus_reinits = 0
@@ -59,6 +61,11 @@ class FakeWled:
         for key in ("chan", "hide", "behav"):
             if key in ap:
                 self.cfg["ap"][key] = ap[key]
+        ins = (doc.get("nw") or {}).get("ins") or []
+        if ins:  # like WLED: an empty name or password keeps the old one
+            ssid, psk = ins[0].get("ssid") or self.wifi[0], ins[0].get("psk") or self.wifi[1]
+            self.wifi = (ssid, psk)
+            self.cfg["nw"]["ins"][0].update(ssid=ssid, pskl=len(psk))
 
     def info(self):
         return {"ver": "0.15.0", "leds": {"count": 80, "rgbw": True, "cct": 1, "lc": 7}, "name": "Test WLED",

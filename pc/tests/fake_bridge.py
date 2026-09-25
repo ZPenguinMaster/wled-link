@@ -38,6 +38,7 @@ class FakeBridge:
         self.drop_next = False
         self.window_violations = 0
         self.config_payloads = []
+        self.ssid, self.password = "WLEDLink", "fake-pass-0000"
         self.udp_sent = 0
         self.sessions = 0
         self.gaps = 0
@@ -104,8 +105,8 @@ class FakeBridge:
     def _send_info(self):
         self._send_json(wl.B_INFO, {
             "proto": 1, "fw": "fake", "boot": f"{self.boot_id:08x}", "nonce": self.hello_nonce,
-            "host": 1 if self.host_active else 0, "mac": "de:ad:be:ef:00:01", "wifi": 1, "ssid": "WLEDLink",
-            "pass": "quartz-basil-1769", "ch": 6, "chCfg": 0, "hidden": 1, "txq": 34, "withPc": 0, "caps": "ws,baud,phone,espnow", "apIp": "192.168.77.1",
+            "host": 1 if self.host_active else 0, "mac": "de:ad:be:ef:00:01", "wifi": 1, "ssid": self.ssid,
+            "pass": self.password, "ch": 6, "chCfg": 0, "hidden": 1, "txq": 34, "withPc": 0, "caps": "ws,baud,phone,espnow", "apIp": "192.168.77.1",
             "maxConns": MAX_CONNS, "win": WINDOW, "uptime": 1, "heap": 150000, "minHeap": 120000, "sta": len(self.stations),
             "udpTx": self.udp_sent, "udpDrop": 0, "rxBad": 0, "rxGaps": self.gaps, "tcpOpened": 0,
             "phones": 1, "phonePin": "482913", "pairing": 0, "link": self.link_mode, "linkSet": int(self.link_set),
@@ -207,6 +208,10 @@ class FakeBridge:
                 asyncio.get_running_loop().call_later(0.3, self.reboot)
         elif ftype == wl.H_SET_CONFIG:
             self.config_payloads.append(bytes(p))
+            if p[0] != 0xFF:
+                n = p[0]
+                self.ssid = bytes(p[1:1 + n]).decode()
+                self.password = bytes(p[2 + n:2 + n + p[1 + n]]).decode()
             self._send_json(wl.B_CONFIG_RESULT, {"ok": True, "msg": "saved, rebooting"})
             asyncio.get_running_loop().call_later(0.3, self.reboot)
         elif ftype == wl.H_REBOOT:

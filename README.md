@@ -28,7 +28,9 @@ the PC and a Bluetooth remote for your phone, and both react the moment you tap.
 | `pc/tests/` | End-to-end test with a simulated bridge and WLED (`python pc\tests\test_wledlink.py`). |
 | `wled/` | The WLED Link build of WLED for the light: the ESP-NOW link, remembering its look, quicker reconnects. |
 
-**Bridge Wi-Fi:** network `WLEDLink` (hidden), password `quartz-basil-1769` (set in `bridge/src/config.h`).
+**Bridge Wi-Fi:** network `WLEDLink` (hidden), with a password each bridge makes up the first time it starts.
+It's on the control page (*Settings → Bridge Wi-Fi*) and in `python pc\wledlink.py status`; this repository
+holds no password or key.
 
 ---
 
@@ -45,7 +47,7 @@ the PC and a Bluetooth remote for your phone, and both react the moment you tap.
 
 To update the bridge later, run the same command again. It pauses a running link while it works and
 keeps the bridge's settings, Bluetooth PIN and paired phones (`--reset-settings` wipes them back to the
-defaults in `bridge/src/config.h`). Older bridge firmware keeps working with the newest `wledlink.py`,
+defaults in `bridge/src/config.h`, with a newly made-up Wi-Fi password). Older bridge firmware keeps working with the newest `wledlink.py`,
 just without Bluetooth and with slower status updates.
 
 ## 2. Start the link
@@ -80,7 +82,7 @@ shows up in a scan.
   python pc\wledlink.py wled-wifi --port COMy
   ```
   This uses WLED's built-in Improv protocol to set the network name and password. Put the board back afterwards.
-- **In WLED's settings.** Config → WiFi Setup: network `WLEDLink`, password `quartz-basil-1769`,
+- **In WLED's settings.** Config → WiFi Setup: network `WLEDLink`, the password from the control page,
   **delete URHome** from the list, and set Static IP to `0.0.0.0` if you had one. Save.
 
 Also in WiFi Setup, keep **Disable WiFi sleep** checked (the default on ESP32). It keeps realtime colours smooth.
@@ -122,15 +124,20 @@ on the control page. On top of that, the bridge only accepts phones that paired 
 2 minutes, started from the control page (or `python pc\wledlink.py phone pair`, or by holding the bridge's
 BOOT button for 2 s, when its LED blinks fast). Anyone else is disconnected.
 
-**One-time setup on the iPhone:**
-1. Host the page. Web Bluetooth only works on `https://` pages, so upload `pc/phone/index.html` to a
-   free GitHub Pages site: create a public repo such as `lights` on github.com, *Add file → Upload files*
-   with `index.html`, then *Settings → Pages → Deploy from branch → main*. The page is then at
-   `https://<your-username>.github.io/lights/`. It contains no PIN or password.
-2. Install **Bluefy** from the App Store (Safari can't use Bluetooth) and open that address in it.
-   Add it to Bluefy's favourites.
-3. On the laptop's control page, press **Pair a phone**. In Bluefy tap **Connect**, choose **Lamp**,
-   and type the PIN when iOS asks.
+**One-time setup on the iPhone.** Safari can't use Bluetooth, so the phone page opens in the free **Bluefy**
+app, and it has to come from an `https://` address. GitHub serves it for free, straight from this repository:
+
+1. **Put the page online (once, on a computer).** On github.com, open the repository → **Settings** →
+   **Pages**. Under *Build and deployment* choose **Deploy from a branch**, branch **main**, folder **/ (root)**,
+   and **Save**. About a minute later the page is at `https://<your-github-name>.github.io/<repository>/`, for
+   this one **https://zpenguinmaster.github.io/wled-link/**. The control page on the PC shows the address under
+   *Phone → Address* (with a copy button). The page holds no PIN, password or key.
+2. **Open it in Bluefy.** Install **Bluefy – Web BLE Browser** from the App Store and open it. It's a web
+   browser: tap the address bar at the top, type the address from step 1 and open it. Allow Bluetooth if
+   Bluefy asks. Save the page in Bluefy's favourites so it's one tap next time.
+3. **Pair.** On the PC's control page press **Pair a phone** (the bridge's LED blinks fast for 2 minutes).
+   On the phone tap **Connect**, pick **Lamp** from the list, and when iOS asks for a code, type the
+   **Pairing PIN** from the control page.
 
 After that, open the page in Bluefy (tap Connect → Lamp if it doesn't connect by itself) and use it. This works with the laptop
 off as long as the bridge still gets USB power. To start over, use *Forget phones* (and remove
@@ -141,8 +148,8 @@ off as long as the bridge still gets USB power. To start over, use *Forget phone
 The bridge keeps its hidden Wi-Fi running whenever it has power. The PC program isn't needed for
 this, so your phone can talk to WLED directly even with the laptop shut:
 
-1. On the phone, add the Wi-Fi network by hand (it's hidden): name `WLEDLink`, WPA2, password
-   `quartz-basil-1769`. Turn **auto-join / auto-connect off**, so the phone only uses this no-internet
+1. On the phone, add the Wi-Fi network by hand (it's hidden): name `WLEDLink`, WPA2, and the password from
+   the control page. Turn **auto-join / auto-connect off**, so the phone only uses this no-internet
    network when you pick it. On Android, answer **Stay connected** if it warns about no internet.
 2. Open **http://192.168.77.2** (WLED's full UI; add it to your home screen), or use the **WLED app**,
    which finds the light by itself.
@@ -235,7 +242,8 @@ Official WLED updates replace it; `wled\build.ps1` rebuilds it on a newer versio
 | `python pc\wledlink.py bridge-config --wifi always\|with-pc` | Bridge Wi-Fi on whenever it has power (default, needed for phone control with the PC off) or only while the program runs. |
 | `python pc\wledlink.py link [espnow\|wifi]` | How the bridge reaches the light: ESP-NOW (no Wi-Fi network, the default) or the hidden Wi-Fi network. Without a choice, shows the current one. |
 | `python pc\wledlink.py ports` | List serial ports. |
-| `python pc\wledlink.py bridge-config --password NEW --channel 6` | Change the bridge Wi-Fi (the bridge restarts). Give WLED the new details too. |
+| `python pc\wledlink.py bridge-config --password NEW --channel 6` | Change the bridge Wi-Fi (the bridge restarts). WLED gets the new name and password first, so nothing has to be typed into it. |
+| `python pc\wledlink.py bridge-config --new-password` | A new random Wi-Fi password, for the bridge and WLED alike. |
 | `python pc\wledlink.py flash-bridge --port COMx` | Flash `bridge/prebuilt/wledlink-bridge.bin`, keeping the bridge's settings and paired phones (`--reset-settings` to wipe them). |
 | `python pc\wledlink.py wled-wifi --port COMy` | Point a USB-connected WLED board at the bridge Wi-Fi. |
 | `python pc\wledlink.py wled-update [file.bin]` | Install WLED firmware on the light through the link (default: the WLED Link build in `wled/prebuilt/`), keeping its look. |
@@ -330,7 +338,8 @@ also refuses requests that come from other websites open in your browser: cross-
 from foreign pages, and DNS-rebinding tricks. Those would otherwise be able to change settings or read
 the status page, which shows the Wi-Fi password and the Bluetooth PIN. The bridge's Wi-Fi is WPA2, and
 its Bluetooth control needs a PIN-paired, encrypted link from a phone you approved. This repository
-contains the bridge's Wi-Fi password (`bridge/src/config.h` and the prebuilt image), so keep it private.
+holds no passwords or keys: each bridge makes up its own Wi-Fi password and radio-link key on first start,
+and they stay on your devices and this PC, so it's fine to keep it public.
 
 Why URHome was likely flaky (educated guess, not verified against Purdue's setup): campus device networks
 commonly isolate clients from each other and from PCs on the main network, drop idle or low-signal clients,

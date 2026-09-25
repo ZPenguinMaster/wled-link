@@ -243,11 +243,13 @@ code { font-family: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospac
         <div class="row"><span class="k">Bluetooth name</span><span class="v">Lamp</span></div>
         <div class="row"><span class="k">Pairing PIN</span><span class="v mono" id="rPin">—</span></div>
         <div class="row"><span class="k">Paired phones</span><span class="v" id="rPhones">—</span></div>
+        <div class="row"><span class="k">Address</span><span class="v mono" id="rPhoneUrl">—</span></div>
         <div class="row-actions">
           <button class="btn primary" id="pairBtn">Pair a phone</button>
           <button class="btn" id="forgetBtn">Forget phones</button>
         </div>
-        <div class="hint">Open the Lights page in Bluefy on your iPhone, tap Connect and enter the PIN.</div>
+        <div class="hint">On your iPhone, open the phone page in the Bluefy app. Press Pair a phone here, then tap
+          Connect there, pick Lamp and type the PIN when iOS asks.</div>
       </section>
 
       <section class="card list">
@@ -407,6 +409,9 @@ function render() {
   const st = s && s.stations && s.stations[0];
   $("rSignal").textContent = lk.mode === "espnow" ? (lk.up ? "Linked" : "Not linked")
     : st ? `${st.rssi} dBm${w && w.signal != null ? ` · ${w.signal}%` : ""}` : "—";
+  const pu = s && s.phoneUrl;
+  $("rPhoneUrl").innerHTML = pu ? `${esc(pu.replace(/^https:\/\//, "").replace(/\/$/, ""))}<button class="copy" data-copy="${esc(pu)}" title="Copy"><svg><use href="#i-copy"/></svg></button>`
+    : "see the README (GitHub Pages)";
   $("rAddr").innerHTML = s ? `${esc(s.listen)}<button class="copy" data-copy="${esc(s.listen)}" title="Copy"><svg><use href="#i-copy"/></svg></button>` : "—";
 
   // phone card

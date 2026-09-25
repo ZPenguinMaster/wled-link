@@ -19,6 +19,7 @@ import asyncio
 import binascii
 import collections
 import contextlib
+import functools
 import hashlib
 import hmac
 import html
@@ -220,6 +221,30 @@ def save_link(data: dict):
 def key_fingerprint(key: bytes) -> str:
     """Which key a device has, without revealing it (same as wll::fingerprint in link_proto.h)."""
     return hmac.new(key, b"WLLF", hashlib.sha256).digest()[:4].hex()
+
+
+@functools.lru_cache(maxsize=1)
+def phone_page_url() -> str | None:
+    """Where GitHub Pages serves the phone page when this copy is a clone of a GitHub repository with Pages
+    turned on (see README): the repository's root sends phones on to pc/phone/."""
+    try:
+        url = subprocess.run(["git", "-C", str(ROOT), "config", "--get", "remote.origin.url"], capture_output=True,
+                             text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"github\.com[:/]([\w.-]+)/([\w.-]+?)(?:\.git)?/?$", url)
+    return f"https://{m.group(1).lower()}.github.io/{m.group(2)}/" if m else None
+
+
+def wifi_fingerprint(ssid: str, password: str) -> str:
+    """Which Wi-Fi details WLED was last given, without keeping the password itself."""
+    return hashlib.sha256(f"{ssid}\n{password}".encode()).hexdigest()[:16]
+
+
+def make_password() -> str:
+    """12 random characters in groups of 4, like the ones the bridge makes up (nothing that reads as something else)."""
+    raw = "".join(secrets.choice("abcdefghjkmnpqrstuvwxyz23456789") for _ in range(12))
+    return "-".join(raw[i:i + 4] for i in range(0, 12, 4))
 
 
 def slow_usb_bridges() -> dict:
@@ -635,6 +660,7 @@ class Bridge:
         self._link_busy = False
         self._link_switch_at = -1e9
         self._link_down_since: float | None = None
+        self._wifi_sync_at = -1e9
         self.link_note = ""
 
     # -- live updates for the status page
@@ -1011,6 +1037,7 @@ class Bridge:
             try:
                 await self._resolve(forced)
                 await self._reconcile_link()
+                await self._sync_wled_wifi()
                 await self._sync_time()
                 if self.target and time.monotonic() - self.target.get("settings_at", -1e9) > 300:
                     await self.wled_settings()
@@ -1414,6 +1441,67 @@ class Bridge:
         self.send(H_SET_CONFIG, payload)
         return await asyncio.wait_for(fut, 5)
 
+    async def _give_wled_wifi(self, ssid: str, password: str):
+        """Stores the bridge's Wi-Fi name and password in WLED: it uses them in Wi-Fi mode, and in ESP-NOW
+        mode when it checks for the bridge's network now and then. WLED keeps its current connection."""
+        cfg = await self.wled_settings()
+        if cfg is None:
+            raise ConnectionError("couldn't read WLED's settings (is a settings PIN set?)")
+        await self.update_wled_settings(cfg, {"nw": {"ins": [{"ssid": ssid, "psk": password}]}})
+        ins = (((await self.wled_settings()) or {}).get("nw") or {}).get("ins") or [{}]
+        if ins[0].get("ssid") != ssid or ins[0].get("pskl") != len(password):
+            raise ConnectionError("WLED didn't keep them")
+        self._link["wifiGiven"] = wifi_fingerprint(ssid, password)
+        save_link(self._link)
+
+    async def _sync_wled_wifi(self):
+        """Keeps WLED's copy of the bridge's Wi-Fi details current, e.g. after the bridge was reset (and made
+        up a new password). Over ESP-NOW that works whatever WLED has; on Wi-Fi, reaching WLED at all means it has them."""
+        ssid, password = self.info.get("ssid"), self.info.get("pass")
+        if not (self.target and ssid and password) or self._link.get("wifiGiven") == wifi_fingerprint(ssid, password):
+            return
+        if self.info.get("link") != "espnow":
+            self._link["wifiGiven"] = wifi_fingerprint(ssid, password)
+            save_link(self._link)
+            return
+        if time.monotonic() - self._wifi_sync_at < 600:  # say it can't be read (settings PIN): don't keep trying
+            return
+        self._wifi_sync_at = time.monotonic()
+        try:
+            await self._give_wled_wifi(ssid, password)
+            log.info("Gave WLED the bridge's current Wi-Fi name and password")
+        except (LinkDown, ConnectionError, asyncio.TimeoutError, OSError) as exc:
+            log.warning("Couldn't give WLED the bridge's Wi-Fi details: %s", exc)
+
+    async def set_bridge_config(self, args: dict) -> dict:
+        """Changes the bridge's settings. A new Wi-Fi name or password goes to WLED first, while WLED can still
+        be reached (on Wi-Fi its connection holds until the bridge restarts with the new ones), so nothing has
+        to be typed into WLED."""
+        payload = config_payload(args)
+        notes = []
+        old = (self.info.get("ssid"), self.info.get("pass"))
+        new = (str(args.get("ssid", "")), str(args.get("password", "")))
+        gave = False
+        if args.get("reset"):
+            notes.append("Back to the defaults, with a new Wi-Fi password the bridge makes up. Over ESP-NOW the light "
+                         "gets it by itself; on Wi-Fi, give it to the light with: python wledlink.py wled-wifi")
+        elif new != old and self.target:
+            try:
+                await self._give_wled_wifi(*new)
+                gave = True
+                notes.append("WLED has the new Wi-Fi name and password too.")
+            except (LinkDown, ConnectionError, asyncio.TimeoutError, OSError) as exc:
+                notes.append(f"Couldn't give WLED the new Wi-Fi details ({exc}); give them to it with: python wledlink.py wled-wifi")
+        elif new != old:
+            notes.append("WLED can't be reached right now; give it the new Wi-Fi details with: python wledlink.py wled-wifi")
+        result = dict(await self.set_config(payload))
+        if not result.get("ok") and gave and all(old):
+            with contextlib.suppress(LinkDown, ConnectionError, asyncio.TimeoutError, OSError):
+                await self._give_wled_wifi(*old)  # the bridge kept its old ones, so WLED does too
+            notes = []
+        result["notes"] = notes + [result.get("msg", "")] if result.get("ok") else notes
+        return result
+
     def status(self) -> dict:
         info, counters, target, link = self.info, self.bridge_stats, self.target, self.link
         wled = None
@@ -1425,6 +1513,7 @@ class Bridge:
         return {
             "version": VERSION,
             "listen": self.cfg.listen,
+            "phoneUrl": phone_page_url(),
             "bridge": {
                 "state": self.state, "port": self.port_name, "firmware": info.get("fw"), "mac": info.get("mac"),
                 "wifiUp": bool(info.get("wifi")), "ssid": info.get("ssid"), "password": info.get("pass"),
@@ -1706,7 +1795,7 @@ class HttpFront:
             return await reply_json({"error": "expected a JSON object"}, 400)
         try:
             if path == "/__wledlink/api/bridge-config":
-                return await reply_json(await b.set_config(config_payload(args)))
+                return await reply_json(await b.set_bridge_config(args))
             if path == "/__wledlink/api/bridge-reboot":
                 b.send(H_REBOOT)
                 return await reply_json({"ok": True})
@@ -1845,6 +1934,8 @@ def cmd_status(cfg: Config) -> int:
         print(f"Bridge : {b['state']}" + (f" on {b.get('port')}, ESP-NOW on channel {b.get('channel')} (no Wi-Fi network)" if b.get("port") else ""))
         print("Light  : " + ("linked over ESP-NOW (" + ", ".join(x["mac"] for x in s["stations"]) + ")" if link.get("up") and s["stations"]
                              else "not linked yet"))
+        if b.get("ssid"):
+            print(f"Wi-Fi  : \"{b.get('ssid')}\" / \"{b.get('password')}\" (off the air until you switch to Wi-Fi)")
     else:
         print(f"Bridge : {b['state']}" + (f" on {b.get('port')}, Wi-Fi \"{b.get('ssid')}\" / \"{b.get('password')}\", channel {b.get('channel')}" if b.get("ssid") else ""))
         print("Devices: " + (", ".join(f"{x['mac']} {x['ip']} ({x['rssi']} dBm)" for x in s["stations"]) or "none joined"))
@@ -1881,15 +1972,16 @@ def cmd_bridge_config(cfg: Config, args) -> int:
         body = {"reset": True}
     else:
         body = {"ssid": args.ssid or current.get("ssid"),
-                "password": args.password or current.get("password"),
+                "password": make_password() if args.new_password else args.password or current.get("password"),
                 "channel": (current.get("channelSetting") or 0) if args.channel is None else args.channel,
                 "hidden": current.get("hidden") if args.hidden is None else args.hidden,
                 "txPowerDbm": (current.get("txPowerDbm") or 8.5) if args.txpower is None else args.txpower,
                 "wifiWithPc": current.get("wifiWithPc") if args.wifi is None else args.wifi == "with-pc"}
     result = daemon_call(cfg, "/__wledlink/api/bridge-config", body) or {}
-    print(result.get("msg") or result.get("error") or result)
-    if result.get("ok") and not args.reset and (body["ssid"], body["password"]) != (current.get("ssid"), current.get("password")):
-        print("Remember to give WLED the new network name/password too (python wledlink.py wled-wifi).")
+    for line in result.get("notes") or [result.get("msg") or result.get("error") or result]:
+        print(line)
+    if result.get("ok") and args.new_password:
+        print("The new password is on the control page (Settings > Bridge Wi-Fi) and in: python wledlink.py status")
     return 0 if result.get("ok") else 1
 
 
@@ -2179,6 +2271,7 @@ def main(argv=None) -> int:
     cfgp = sub.add_parser("bridge-config", help="change the bridge's Wi-Fi (bridge restarts)")
     cfgp.add_argument("--ssid")
     cfgp.add_argument("--password")
+    cfgp.add_argument("--new-password", action="store_true", help="make up a new random password (WLED gets it too)")
     cfgp.add_argument("--channel", type=int, help="0 = automatic, or 1-11")
     cfgp.add_argument("--hidden", action=argparse.BooleanOptionalAction, default=None)
     cfgp.add_argument("--txpower", type=float, help="TX power in dBm (2-19.5, default 8.5)")

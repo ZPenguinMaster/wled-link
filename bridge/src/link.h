@@ -8,8 +8,9 @@
 
 enum LinkMode : uint8_t { LINK_ESPNOW = 0, LINK_WIFI = 1 };
 
+void randomBytes(void* out, size_t n);  // truly random, also before the radio is on (keys, passwords)
 void linkLoad();                     // mode, key and remembered channel from flash
-void linkEnsureKey();                // makes a key on first use (call once the radio is on: true randomness)
+void linkEnsureKey();                // makes a key on first use
 LinkMode linkMode();                 // Wi-Fi until the PC chose a mode, so a new light can be set up
 bool linkModeChosen();
 bool linkSetMode(LinkMode m);        // saves it; takes effect after a restart

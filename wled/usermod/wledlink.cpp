@@ -10,6 +10,7 @@
 // The bridge decides: each HELLO it sends names the mode and channel, and the light follows.
 
 #include "wled.h"
+#include <Preferences.h>
 #include <esp_now.h>
 #include <lwip/sockets.h>
 #include "link_proto.h"
@@ -68,12 +69,14 @@ QueueHandle_t rxq = nullptr;
 volatile uint32_t rxFrames = 0;  // our frames that reached WLED at all
 Conn conns[MAX_CONNS];
 int udpSock = -1;
-uint8_t sockBuf[TCP_CHUNK];
+uint8_t sockBuf[1 + TCP_CHUNK];  // connection id, then the data
 
-// settings (cfg.json, usermod "WLEDLink")
+// settings: cfg.json (usermod "WLEDLink"), except the key, which stays in NVS where neither WLED's settings
+// pages nor its config backups show it
 uint8_t cfgMode = wll::MODE_WIFI, cfgChannel = 1;
 uint8_t cfgKey[16];
 bool cfgHaveKey = false, cfgRestore = true;
+bool keyInNvs = false;  // false: NVS couldn't take it, so cfg.json keeps it
 
 // what runs right now (differs from cfgMode during a trial)
 uint8_t runMode = wll::MODE_WIFI;
@@ -106,6 +109,22 @@ bool hexToKey(const char* s, uint8_t out[16]) {
 
 void keyToHex(const uint8_t k[16], char out[33]) {
   for (int i = 0; i < 16; i++) sprintf(out + i * 2, "%02x", k[i]);
+}
+
+bool loadKey(uint8_t out[16]) {
+  Preferences p;
+  if (!p.begin("wllink", true)) return false;  // fails until something was stored
+  bool ok = p.getBytes("key", out, 16) == 16;
+  p.end();
+  return ok;
+}
+
+bool storeKey(const uint8_t k[16]) {
+  Preferences p;
+  if (!p.begin("wllink", false)) return false;
+  bool ok = p.putBytes("key", k, 16) == 16;
+  p.end();
+  return ok;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -142,6 +161,12 @@ void runRadio(uint8_t mode) {
   runMode = mode;
   runSince = millis();
   if (espNowOnlyChannel == ch && enableESPNow && statusESPNow == ESP_NOW_STATE_ON) return;
+  if (espNowOnlyChannel && ch && enableESPNow && statusESPNow == ESP_NOW_STATE_ON) {  // only the channel moves
+    espNowOnlyChannel = ch;
+    tuneTo(ch);
+    hunting = false;
+    return;
+  }
   espNowOnlyChannel = ch;
   enableESPNow = true;
   localUp = false;
@@ -476,7 +501,7 @@ void maintain(uint32_t now) {
   }
   // ESP-NOW mode: sweep the other channels now and then, in case the bridge moved
   if (runMode != wll::MODE_ESPNOW || statusESPNow != ESP_NOW_STATE_ON) return;
-  if (!hunting && now - lastChannelCheck > CHANNEL_CHECK_MS) {
+  if (!hunting && !wlink.handshaking() && now - lastChannelCheck > CHANNEL_CHECK_MS) {
     lastChannelCheck = now;
     uint8_t ch = 0;
     wifi_second_chan_t second;
@@ -508,13 +533,11 @@ void pumpLink() {
   if (!cfgHaveKey) return;
   uint32_t now = millis();
   RxFrame f;
-  while (rxq && xQueueReceive(rxq, &f, 0) == pdTRUE) {
-    // a HELLO on a channel we were only visiting: that is the bridge's channel now
-    if (hunting && f.len >= 4 && f.data[1] == wll::F_HELLO) {
-      hunting = false;
-      lastHunt = now;
-    }
-    wlink.onFrame(f.mac, f.data, f.len, now);
+  while (rxq && xQueueReceive(rxq, &f, 0) == pdTRUE) wlink.onFrame(f.mac, f.data, f.len, now);
+  // the bridge answered on a channel we were only visiting: stay, that is its channel now
+  if (hunting && (wlink.handshaking() || wlink.up())) {
+    hunting = false;
+    lastHunt = now;
   }
   wlink.tick(now);
   if (wlink.up()) {
@@ -606,6 +629,7 @@ class WledLinkUsermod : public Usermod {
     if (k && hexToKey(k, key) && (!cfgHaveKey || memcmp(key, cfgKey, 16))) {
       memcpy(cfgKey, key, 16);
       cfgHaveKey = true;
+      keyInNvs = storeKey(cfgKey);
       wlink.setKey(cfgKey);
       changed = true;
     }
@@ -634,32 +658,51 @@ class WledLinkUsermod : public Usermod {
 
   void addToConfig(JsonObject& root) override {
     JsonObject top = root.createNestedObject(F("WLEDLink"));
-    char hex[33] = "";
-    if (cfgHaveKey) keyToHex(cfgKey, hex);
     top[F("mode")] = cfgMode == wll::MODE_ESPNOW ? "espnow" : "wifi";
     top[F("ch")] = cfgChannel;
-    top[F("key")] = hex;
     top[F("restore")] = cfgRestore;
+    if (cfgHaveKey && !keyInNvs) {  // only if NVS refused it
+      char hex[33];
+      keyToHex(cfgKey, hex);
+      top[F("key")] = hex;
+    }
   }
 
   bool readFromConfig(JsonObject& root) override {
     JsonObject top = root[F("WLEDLink")];
-    if (top.isNull()) return false;
+    keyInNvs = loadKey(cfgKey);
+    uint8_t old[16];
+    if (!top.isNull() && hexToKey(top[F("key")] | "", old)) {  // earlier builds kept it in cfg.json: move it
+      if (!keyInNvs || memcmp(old, cfgKey, 16)) {
+        memcpy(cfgKey, old, 16);
+        keyInNvs = storeKey(cfgKey);
+      }
+      cfgHaveKey = true;
+      if (keyInNvs) configNeedsWrite = true;  // and cfg.json goes without it from now on
+    } else {
+      cfgHaveKey = keyInNvs;
+    }
+    if (top.isNull()) {  // WLED's settings were reset: the key survived, so the bridge can still be found
+      applyKey();
+      return false;
+    }
     const char* m = top[F("mode")] | "wifi";
     cfgMode = strcmp(m, "espnow") == 0 ? wll::MODE_ESPNOW : wll::MODE_WIFI;
     int ch = top[F("ch")] | 1;
     cfgChannel = ch >= 1 && ch <= 13 ? ch : 1;
-    cfgHaveKey = hexToKey(top[F("key")] | "", cfgKey);
     cfgRestore = top[F("restore")] | true;
-    if (cfgHaveKey) {
-      wlink.setKey(cfgKey);
-      // at boot this runs before WLED sets up its radio, so the first setup is already the right one
-      runMode = cfgMode;
-      espNowOnlyChannel = cfgMode == wll::MODE_ESPNOW ? cfgChannel : 0;
-      enableESPNow = true;
-      settingsChanged = true;
-    }
+    applyKey();
     return !top[F("restore")].isNull();
+  }
+
+  void applyKey() {
+    if (!cfgHaveKey) return;
+    wlink.setKey(cfgKey);
+    // at boot this runs before WLED sets up its radio, so the first setup is already the right one
+    runMode = cfgMode;
+    espNowOnlyChannel = cfgMode == wll::MODE_ESPNOW ? cfgChannel : 0;
+    enableESPNow = true;
+    settingsChanged = true;
   }
 
   uint16_t getId() override { return USERMOD_ID_WLEDLINK; }
