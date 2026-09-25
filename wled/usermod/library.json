@@ -1,0 +1,5 @@
+{
+  "name": "wledlink",
+  "build": { "libArchive": false },
+  "dependencies": {}
+}

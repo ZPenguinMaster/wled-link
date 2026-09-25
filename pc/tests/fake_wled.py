@@ -5,7 +5,9 @@ Like WLED's AsyncWebServer it answers one request per connection and then closes
 
 import asyncio
 import hashlib
+import hmac
 import json
+import time
 
 HTML = b"<!DOCTYPE html><html><head><title>WLED</title></head><body>fake WLED UI " + b"x" * 5000 + b"</body></html>"
 BIG = bytes((i * 7 + (i >> 8)) & 0xFF for i in range(300_000))
@@ -31,8 +33,11 @@ class FakeWled:
         self.cfg_locked = False  # behaves like a settings PIN is set
         self.cfg_posts = []
         self.bus_reinits = 0
-        self.uptime = 5000
+        self.booted = time.monotonic() - 5000
         self.firmware_uploads = []  # sizes of the files posted to /update
+        self.update_answers = True  # False: restarts before its answer is out, as it can over ESP-NOW
+        self.wll = None             # the WLED Link usermod's info, once "installed" by a test
+        self.wll_key = None
 
     def apply_cfg(self, doc):
         """Like WLED 0.15's deserializeConfig for these keys, including what it resets when a key is missing."""
@@ -58,7 +63,8 @@ class FakeWled:
     def info(self):
         return {"ver": "0.15.0", "leds": {"count": 80, "rgbw": True, "cct": 1, "lc": 7}, "name": "Test WLED",
                 "udpport": 21324, "live": False, "brand": "WLED", "product": "FOSS", "mac": "aabbccddeeff",
-                "ip": self.reported_ip, "uptime": self.uptime, "release": "ESP32", "wifi": {"bssid": "00:00:00:00:00:00", "rssi": -40, "signal": 100, "channel": 6}}
+                **({"wll": self.wll} if self.wll is not None else {}),
+                "ip": self.reported_ip, "uptime": int(time.monotonic() - self.booted), "release": "ESP32", "wifi": {"bssid": "00:00:00:00:00:00", "rssi": -40, "signal": 100, "channel": 6}}
 
     async def start(self):
         self.server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
@@ -118,8 +124,11 @@ class FakeWled:
             boundary = headers["content-type"].split("boundary=")[1].encode()
             part = body.split(b"--" + boundary)[1]
             self.firmware_uploads.append(len(part.split(bytes([13, 10, 13, 10]), 1)[1]) - 2)
-            send("200 OK", b"<html><body><h2>Update successful!</h2>Rebooting...</body></html>", "text/html")
-            self.uptime = 2
+            if self.update_answers:
+                send("200 OK", b"<html><body><h2>Update successful!</h2>Rebooting...</body></html>", "text/html")
+            else:
+                writer.transport.abort()
+            self.booted = time.monotonic() - 2
             self.state.update(on=True, bri=128, lor=0)  # WLED's power-on look
         elif path in ("/json/state", "/json/state/") and method == "GET":
             send("200 OK", json.dumps(self.state).encode())
@@ -127,6 +136,13 @@ class FakeWled:
             posted = json.loads(body)
             self.posts.append(posted)
             self.state.update({k: v for k, v in posted.items() if k in ("on", "bri", "lor")})
+            link = posted.get("WLEDLink")
+            if isinstance(link, dict) and self.wll is not None:
+                if "key" in link:
+                    self.wll_key = bytes.fromhex(link["key"])
+                    self.wll["kf"] = hmac.new(self.wll_key, b"WLLF", hashlib.sha256).digest()[:4].hex()
+                if "restore" in link:
+                    self.wll["restore"] = bool(link["restore"])
             send("200 OK", b'{"success":true}')
         elif path == "/":
             send("200 OK", HTML, "text/html")

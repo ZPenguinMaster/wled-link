@@ -22,10 +22,11 @@
 #include <esp_netif_sta_list.h>
 #include <lwip/sockets.h>
 #include "config.h"
+#include "link.h"
 #include "phone.h"
 #include "wled.h"
 
-#define FW_VERSION "1.4.0"
+#define FW_VERSION "1.5.0"
 static const uint8_t PROTO_VERSION = 1;
 
 enum MsgType : uint8_t {
@@ -41,6 +42,8 @@ enum MsgType : uint8_t {
   H_PHONE_PIN = 0x09,       // pin(4 LE), answered with CONFIG_RESULT
   H_WLED_CMD = 0x0B,        // JSON WLED state command, sent on to WLED over the bridge's WebSocket
   H_SET_BAUD = 0x0C,        // rate(4 LE): answered with BAUD, then the bridge switches speed
+  H_SET_LINK = 0x0D,        // mode(1: 0 ESP-NOW, 1 Wi-Fi, 0xFF keep) [key(16)]: answered with CONFIG_RESULT
+  H_LINK_KEY_REQ = 0x0E,    // answered with LINK_KEY
   H_TCP_OPEN = 0x10,        // conn(1) ip(4) port(2 BE)
   H_TCP_DATA = 0x11,        // conn(1) data
   H_TCP_CLOSE = 0x12,       // conn(1): flush what is pending, then close
@@ -53,6 +56,10 @@ enum MsgType : uint8_t {
   B_STATS = 0x86,           // JSON
   B_WLED_STATE = 0x88,      // JSON: the light's state, sent whenever it changes
   B_BAUD = 0x89,            // ok(1) rate(4 LE)
+  B_LINK_KEY = 0x8A,        // key(16), or nothing if there is none yet
+  // bridge -> WLED over the radio link only
+  L_RESET = 0x42,           // the PC's session ended: close every connection
+  L_MODE = 0x43,            // mode(1) channel(1): about to switch, follow now
   B_TCP_OPEN_RESULT = 0x90, // conn(1) status(1)
   B_TCP_DATA = 0x91,        // conn(1) data
   B_TCP_CLOSED = 0x92,      // conn(1) reason(1); only after this may the host reuse the slot
@@ -67,6 +74,8 @@ static const size_t MAX_FRAME = MAX_PAYLOAD + 4;                   // type + seq
 static const size_t MAX_ENCODED = MAX_FRAME + MAX_FRAME / 254 + 2;
 static const int MAX_CONNS = 6;            // browsers use at most 6 per site; each can hold ~6 KB of lwIP buffers
 static const size_t CONN_WINDOW = 4096;    // unacknowledged host->WLED bytes allowed per connection
+static const size_t LINK_WINDOW = 2048;    // the same, in ESP-NOW mode (WLED's usermod holds it)
+static const char* LINK_WLED_IP = "192.168.77.2";  // how WLED shows up to the PC in ESP-NOW mode
 static const size_t TCP_CHUNK = 1024;      // max WLED->host bytes per frame
 static const uint32_t HOST_TIMEOUT_MS = 3000;
 static const uint32_t CONNECT_TIMEOUT_MS = 4000;
@@ -239,6 +248,8 @@ static uint8_t rxFrame[MAX_FRAME];
 static uint8_t sockBuf[TCP_CHUNK];
 
 static void apStart();  // Wi-Fi section below
+static bool espnow() { return linkMode() == LINK_ESPNOW; }
+static uint8_t relayed = 0;  // ESP-NOW mode: connections the PC has open through WLED's usermod (bit per slot)
 
 static uint32_t serialBaud = WL_SERIAL_BAUD;
 static uint32_t baudTrialUntil = 0;  // a new speed is kept only if the host is heard at it by then
@@ -265,36 +276,42 @@ static size_t jsonEscape(char* out, size_t cap, const char* s) {
 
 // Counters shared by INFO and STATS (no braces, so it can be spliced into either object).
 static int formatStats(char* out, size_t cap) {
+  char lk[96];
+  linkStatsText(lk, sizeof lk);
   return snprintf(out, cap,
       "\"uptime\":%lu,\"heap\":%lu,\"minHeap\":%lu,\"sta\":%d,\"udpTx\":%lu,\"udpDrop\":%lu,\"rxBad\":%lu,\"rxGaps\":%lu,"
-      "\"tcpOpened\":%lu,\"phones\":%d,\"phonePin\":\"%06lu\",\"pairing\":%d",
+      "\"tcpOpened\":%lu,\"phones\":%d,\"phonePin\":\"%06lu\",\"pairing\":%d,\"linkUp\":%d,\"lkSent\":%lu,\"lkLost\":%lu,\"lkStalls\":%lu,\"lk\":\"%s\"",
       (unsigned long)(millis() / 1000), (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMinFreeHeap(),
       staCount, (unsigned long)stats.udpTx,
       (unsigned long)stats.udpDrop, (unsigned long)stats.rxBad, (unsigned long)stats.rxGaps,
-      (unsigned long)stats.tcpOpened, phoneCount(), (unsigned long)phonePin(), phonePairingLeft());
+      (unsigned long)stats.tcpOpened, phoneCount(), (unsigned long)phonePin(), phonePairingLeft(), linkUp() ? 1 : 0,
+      (unsigned long)linkFramesSent(), (unsigned long)linkFramesLost(), (unsigned long)linkStalls(), lk);
 }
 
 static void sendInfo() {
   uint8_t mac[6];
   esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);  // works while the Wi-Fi driver is off
-  char ssid[70], pass[130], counters[320], buf[960];
+  char ssid[70], pass[130], counters[480], buf[1152], lkf[9];
   jsonEscape(ssid, sizeof ssid, settings.ssid);
   jsonEscape(pass, sizeof pass, settings.pass);
   formatStats(counters, sizeof counters);
+  linkFingerprint(lkf);
   int n = snprintf(buf, sizeof buf,
       "{\"proto\":%u,\"fw\":\"%s\",\"boot\":\"%08lx\",\"nonce\":%lu,\"host\":%d,"
       "\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"wifi\":%d,\"ssid\":\"%s\",\"pass\":\"%s\","
-      "\"ch\":%u,\"chCfg\":%u,\"hidden\":%u,\"txq\":%u,\"withPc\":%u,\"caps\":\"ws,baud,phone\",\"apIp\":\"%s\",\"maxConns\":%d,\"win\":%u,%s}",
+      "\"ch\":%u,\"chCfg\":%u,\"hidden\":%u,\"txq\":%u,\"withPc\":%u,\"caps\":\"ws,baud,phone,espnow\",\"apIp\":\"%s\",\"maxConns\":%d,\"win\":%u,"
+      "\"link\":\"%s\",\"linkSet\":%d,\"lkf\":\"%s\",%s}",
       PROTO_VERSION, FW_VERSION, (unsigned long)bootId, (unsigned long)helloNonce, hostActive ? 1 : 0,
       mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], apOn ? 1 : 0, ssid, pass,
       apChannel, settings.channel, settings.hidden, settings.txq, settings.withPc, IPAddress(WL_AP_IP).toString().c_str(),
-      MAX_CONNS, (unsigned)CONN_WINDOW, counters);
+      MAX_CONNS, (unsigned)(espnow() ? LINK_WINDOW : CONN_WINDOW), espnow() ? "espnow" : "wifi", linkModeChosen() ? 1 : 0, lkf,
+      counters);
   if (n > 0 && (size_t)n < sizeof buf) sendFrame(B_INFO, buf, n);
   lastBeaconMs = millis();
 }
 
 static void sendStats() {
-  char buf[340];
+  char buf[500];
   buf[0] = '{';
   int n = 1 + formatStats(buf + 1, sizeof buf - 2);
   if (n > (int)sizeof buf - 2) n = sizeof buf - 2;
@@ -304,6 +321,17 @@ static void sendStats() {
 
 static void sendStaList() {
   char buf[96 * WL_MAX_STATIONS + 32];
+  uint8_t m[6];
+  if (espnow()) {
+    bool up = linkUp() && linkPeerMac(m);
+    int n = up ? snprintf(buf, sizeof buf, "{\"sta\":[{\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"ip\":\"%s\",\"rssi\":0,\"link\":\"espnow\"}]}",
+                          m[0], m[1], m[2], m[3], m[4], m[5], LINK_WLED_IP)
+               : snprintf(buf, sizeof buf, "{\"sta\":[]}");
+    staCount = up ? 1 : 0;
+    staCountAtMs = millis();
+    sendFrame(B_STA_LIST, buf, n);
+    return;
+  }
   int n = snprintf(buf, sizeof buf, "{\"sta\":[");
   wifi_sta_list_t wifiList;
   esp_netif_sta_list_t ipList;
@@ -441,7 +469,15 @@ static void handleTcpClose(const uint8_t* p, size_t n) {
 }
 
 static void handleUdpSend(const uint8_t* p, size_t n) {
-  if (n < 6 || udpSock < 0) return;
+  if (n < 6) return;
+  if (espnow()) {
+    if (linkSendDatagram(H_UDP_SEND, p, n)) stats.udpTx++;
+    else stats.udpDrop++;
+    lastActivityMs = millis();
+    if (n > 6 && !((p[4] << 8 | p[5]) == 21324 && p[6] == 0)) wledNoteStream();
+    return;
+  }
+  if (udpSock < 0) return;
   sockaddr_in addr = {};
   addr.sin_family = AF_INET;
   memcpy(&addr.sin_addr.s_addr, p, 4);
@@ -452,6 +488,68 @@ static void handleUdpSend(const uint8_t* p, size_t n) {
     stats.udpTx++;
   lastActivityMs = millis();
   if (n > 6 && !(ntohs(addr.sin_port) == 21324 && p[6] == 0)) wledNoteStream();  // LED data, not a WLED sync packet
+}
+
+// ESP-NOW mode: the PC's connections and UDP go to WLED's usermod over the radio link, which serves
+// them from WLED itself; the answers come back through onLinkMessage().
+static void relayClosed(uint8_t cid, uint8_t reason) {
+  relayed &= ~(1 << cid);
+  uint8_t p[2] = {cid, reason};
+  sendFrame(B_TCP_CLOSED, p, 2);
+}
+
+static void relayCloseAll(uint8_t reason) {
+  for (uint8_t cid = 0; cid < MAX_CONNS; cid++)
+    if (relayed & (1 << cid)) relayClosed(cid, reason);
+}
+
+static void relayOpen(const uint8_t* p, size_t n) {
+  if (n < 7) return;
+  uint8_t cid = p[0];
+  if (cid >= MAX_CONNS) return sendOpenResult(cid, OPEN_BAD_SLOT);
+  if (!linkUp()) return sendOpenResult(cid, OPEN_REFUSED);
+  if (!linkSendMsg(H_TCP_OPEN, p, n)) return sendOpenResult(cid, OPEN_NO_SOCKET);
+  relayed |= 1 << cid;
+  stats.tcpOpened++;
+}
+
+static void relayConn(uint8_t type, const uint8_t* p, size_t n) {
+  if (n < 1 || p[0] >= MAX_CONNS || !(relayed & (1 << p[0]))) return;  // stale: that connection is gone
+  if (!linkSendMsg(type, p, n)) relayClosed(p[0], CLOSE_OVERFLOW);
+}
+
+bool onLinkMessage(const uint8_t* m, size_t n) {
+  if (n < 1) return true;
+  switch (m[0]) {
+    case B_TCP_OPEN_RESULT:
+    case B_TCP_DATA:
+    case B_TCP_CLOSED:
+    case B_TCP_ACK: {
+      if (!hostActive || n < 2 || m[1] >= MAX_CONNS || !(relayed & (1 << m[1]))) return true;  // nobody wants it
+      if (Serial.availableForWrite() < (int)wireSize(n)) return false;  // USB is busy: WLED sends it again soon
+      if (m[0] == B_TCP_CLOSED || (m[0] == B_TCP_OPEN_RESULT && n >= 3 && m[2] != OPEN_OK)) relayed &= ~(1 << m[1]);
+      sendFrame(m[0], m + 1, n - 1);
+      lastActivityMs = millis();
+      return true;
+    }
+    case B_WLED_STATE:
+      wledLinkState((const char*)m + 1, n - 1);
+      return true;
+    default:
+      return true;
+  }
+}
+
+static uint32_t radioRestartDue = 0, lastRadioRestart = 0;
+void onLinkStall() {
+  if (!radioRestartDue && (!lastRadioRestart || millis() - lastRadioRestart > 10000)) radioRestartDue = millis() | 1;
+}
+
+void onLinkChange(bool up) {
+  wledLinkUp(up);
+  staDirty = true;
+  if (!up && hostActive) relayCloseAll(CLOSE_ERROR);
+  if (!up) relayed = 0;
 }
 
 // Moves data between the sockets and the serial link. Returns true if anything happened.
@@ -541,6 +639,8 @@ static void endSession() {
   helloNonce = 0;
   rxExpectSeq = -1;
   closeAllConns();
+  if (relayed) linkSendMsg(L_RESET, nullptr, 0);
+  relayed = 0;
   if (serialBaud != WL_SERIAL_BAUD) setBaud(WL_SERIAL_BAUD);  // beacons always go out at the default speed
 }
 
@@ -573,15 +673,37 @@ static void handleSetConfig(const uint8_t* p, size_t n) {
   for (const char* c = s.pass; *c; c++)
     if (*c < 0x20 || *c > 0x7E) return sendConfigResult(false, "password must be plain ASCII");
   if (s.channel > 11) return sendConfigResult(false, "channel must be 0 (auto) or 1-11");
+  if (s.channel == 0) linkForgetChannel();  // "auto": pick the quietest channel again at the next start
   if (s.txq < 8 || s.txq > 78) return sendConfigResult(false, "TX power must be 2-19.5 dBm");
   if (!saveSettings(s)) return sendConfigResult(false, "could not save settings");
   sendConfigResult(true, "saved, rebooting");
   rebootAtMs = millis() + 300;
 }
 
+static void handleSetLink(const uint8_t* p, size_t n) {
+  if (n < 1) return sendConfigResult(false, "empty request");
+  if (n >= 17 && !linkSetKey(p + 1)) return sendConfigResult(false, "could not save the key");
+  uint8_t m = p[0];
+  if (m == 0xFF) return sendConfigResult(true, n >= 17 ? "key saved" : "no change");
+  if (m > LINK_WIFI) return sendConfigResult(false, "unknown link mode");
+  if (m == linkMode()) {
+    linkSetMode((LinkMode)m);
+    return sendConfigResult(true, "saved");
+  }
+  if (!linkSetMode((LinkMode)m)) return sendConfigResult(false, "could not save the link mode");
+  if (linkUp()) {  // WLED switches with us, rather than having to look for us afterwards
+    uint8_t mm[2] = {m, apChannel};
+    linkSendMsg(L_MODE, mm, 2);
+  }
+  sendConfigResult(true, "switching, restarting");
+  rebootAtMs = millis() + 600;  // time for L_MODE to reach WLED
+}
+
 static void handleHello(uint8_t seq, const uint8_t* p, size_t n) {
   closeAllConns();  // the host starts with no connections, so neither do we
-  apStart();
+  if (relayed) linkSendMsg(L_RESET, nullptr, 0);
+  relayed = 0;
+  if (!espnow()) apStart();
   hostActive = true;
   rxExpectSeq = (seq + 1) & 0xFF;
   helloNonce = n >= 5 ? ((uint32_t)p[1] | (uint32_t)p[2] << 8 | (uint32_t)p[3] << 16 | (uint32_t)p[4] << 24) : 0;
@@ -647,9 +769,11 @@ static void handleFrame(const uint8_t* enc, size_t encLen) {
       }
       break;
     }
-    case H_TCP_OPEN: handleTcpOpen(p, len); break;
-    case H_TCP_DATA: handleTcpData(p, len); break;
-    case H_TCP_CLOSE: handleTcpClose(p, len); break;
+    case H_SET_LINK: handleSetLink(p, len); break;
+    case H_LINK_KEY_REQ: sendFrame(B_LINK_KEY, linkKey(), linkKey() ? 16 : 0); break;
+    case H_TCP_OPEN: espnow() ? relayOpen(p, len) : handleTcpOpen(p, len); break;
+    case H_TCP_DATA: espnow() ? relayConn(H_TCP_DATA, p, len) : handleTcpData(p, len); break;
+    case H_TCP_CLOSE: espnow() ? relayConn(H_TCP_CLOSE, p, len) : handleTcpClose(p, len); break;
     case H_UDP_SEND: handleUdpSend(p, len); break;
     default: break;
   }
@@ -718,24 +842,18 @@ static uint8_t pickChannel() {
   return candidates[best];
 }
 
-// The auto-picked channel, kept across restarts (not power-ups). WLED tries to rejoin once right after
-// it loses the bridge and then only every 18 s, so after a restart the Wi-Fi has to be back before that
-// first try: reusing the channel skips the ~1 s scan.
-RTC_NOINIT_ATTR static uint32_t rtcChannelMagic;
-RTC_NOINIT_ATTR static uint8_t rtcChannel;
-static const uint32_t RTC_CHANNEL_MAGIC = 0x574c4348;
-
+// "Auto" picks the quietest channel once and keeps it (bridge-config --channel 0 picks again). WLED looks
+// for the bridge on the channel it last saw it on, so a steady channel lets it reconnect at once after a
+// restart or a power cut, and skipping the scan brings the radio back about a second sooner.
 static void setupWifi() {
   WiFi.persistent(false);
   if (settings.channel) {
     apChannel = settings.channel;
-  } else if (rtcChannelMagic == RTC_CHANNEL_MAGIC && rtcChannel >= 1 && rtcChannel <= 11 &&
-             esp_reset_reason() != ESP_RST_POWERON) {
-    apChannel = rtcChannel;
+  } else if (linkSavedChannel() >= 1 && linkSavedChannel() <= 11) {
+    apChannel = linkSavedChannel();
   } else {
     apChannel = pickChannel();
-    rtcChannel = apChannel;
-    rtcChannelMagic = RTC_CHANNEL_MAGIC;
+    linkSaveChannel(apChannel);
   }
   WiFi.mode(WIFI_OFF);  // nothing on the air until the PC program connects
   // a device coming or going may be WLED restarting, which would leave the bridge's WebSocket dead
@@ -760,14 +878,42 @@ static void apStart() {
     esp_wifi_set_config(WIFI_IF_AP, &ap);
   }
   esp_wifi_set_max_tx_power((int8_t)settings.txq);
+  if (apOn) linkStart(WIFI_IF_AP, apChannel, LINK_WIFI);  // alongside the network, for switching modes
   staDirty = true;
 }
 
 static void apStop() {
   if (!apOn) return;
+  linkStop();
   WiFi.softAPdisconnect(true);  // also switches the radio off
   apOn = false;
   staCount = 0;
+}
+
+// ESP-NOW mode: the radio is on, on our channel, but there is no network: no access point, no beacons.
+static void radioStart() {
+  WiFi.mode(WIFI_STA);
+  setCountry();
+  WiFi.disconnect();
+  esp_wifi_set_promiscuous(true);  // needed for set_channel while not connected to anything
+  esp_wifi_set_channel(apChannel, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+  esp_wifi_set_max_tx_power((int8_t)settings.txq);
+  linkStart(WIFI_IF_STA, apChannel, LINK_ESPNOW);
+  staDirty = true;
+}
+
+// Starts the radio over, as at power-on: the link, and the network in Wi-Fi mode.
+static void radioRestart() {
+  lastRadioRestart = millis();
+  if (espnow()) {
+    linkStop();
+    WiFi.mode(WIFI_OFF);
+    radioStart();
+  } else if (apOn) {
+    apStop();
+    apStart();
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -780,6 +926,7 @@ static void restartNow() {
   udpSock = -1;
   closeAllConns();
   phoneEnd();
+  linkStop();
   WiFi.mode(WIFI_OFF);
   ESP.restart();
 }
@@ -803,16 +950,21 @@ void setup() {
   if (WL_STATUS_LED_PIN >= 0) pinMode(WL_STATUS_LED_PIN, OUTPUT);
 
   bootId = esp_random();
+  loadSettings();
+  linkLoad();
   for (int i = 0; i < MAX_CONNS; i++) {
     conns[i].state = C_FREE;
     conns[i].sock = -1;
-    conns[i].pending = (uint8_t*)malloc(CONN_WINDOW);
+    // only Wi-Fi mode connects to WLED from here; in ESP-NOW mode WLED's usermod holds the PC's data
+    // (switching modes restarts the bridge)
+    conns[i].pending = espnow() ? nullptr : (uint8_t*)malloc(CONN_WINDOW);
   }
-  loadSettings();
   sendInfo();  // tells a connected PC straight away that the bridge restarted, rather than after its timeout
   setupWifi();
-  if (!settings.withPc) apStart();
-  wledBegin();
+  if (espnow()) radioStart();
+  else if (!settings.withPc) apStart();
+  linkEnsureKey();
+  wledBegin(espnow());
   phoneBegin();
 
   udpSock = lwip_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -828,15 +980,22 @@ void loop() {
   if (hostActive && now - lastHostRxMs > HOST_TIMEOUT_MS) endSession();
   if (settings.withPc && apOn && now - lastHostRxMs > AP_IDLE_OFF_MS) apStop();
   if (!hostActive && now - lastBeaconMs >= BEACON_INTERVAL_MS) sendInfo();
+  linkLoop();
+  char cmd[512];
+  for (size_t n; espnow() && (n = wledTakeLinkCmd(cmd, sizeof cmd));) linkSendMsg(H_WLED_CMD, (const uint8_t*)cmd, n);
   if (staDirty) {
     staDirty = false;
     if (hostActive) sendStaList();
-    else staCount = WiFi.softAPgetStationNum();
+    else staCount = espnow() ? linkUp() : WiFi.softAPgetStationNum();
   } else if (now - staCountAtMs > 1000) {
-    staCount = WiFi.softAPgetStationNum();
+    staCount = espnow() ? linkUp() : WiFi.softAPgetStationNum();
     staCountAtMs = now;
   }
   if (rebootAtMs && (int32_t)(now - rebootAtMs) >= 0) restartNow();
+  if (radioRestartDue) {
+    radioRestartDue = 0;
+    radioRestart();
+  }
   phoneLoop();
   if (baudTrialUntil && (int32_t)(now - baudTrialUntil) > 0) {  // the host never got through at the new speed
     baudTrialUntil = 0;

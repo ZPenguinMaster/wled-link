@@ -131,6 +131,7 @@ async def e2e():
     bridge = FakeBridge(wled.http_addr, wled.udp_addr)
     await bridge.start()
     logdir = tempfile.mkdtemp(prefix="wledlink-test-")
+    os.environ["WLEDLINK_HOME"] = logdir  # CLI calls too: never the real %LOCALAPPDATA%\\wledlink (link key!)
     env = dict(os.environ, WLEDLINK_HOME=logdir)
     log_path = os.path.join(logdir, "daemon.out")
     out = open(log_path, "w")
@@ -336,6 +337,36 @@ async def e2e():
         check("bridge-config reaches the bridge", code == 200 and json.loads(body).get("ok") and bridge.config_payloads[-1] == payload)
         check("still works after the config reboot", await wait_for(json_info_ok, 10, "recovery after config"))
 
+        print("ESP-NOW link")
+        await ahttp("POST", "/__wledlink/api/rescan", b"{}")
+        stored = lambda: json.loads(open(os.path.join(logdir, "link.json")).read()).get("key") if os.path.exists(os.path.join(logdir, "link.json")) else None
+        check("the PC keeps a copy of the bridge's link key", await until(lambda: stored() == bridge.link_key.hex(), 15),
+              stored())
+        s = await status()
+        check("stock WLED: the link stays on Wi-Fi and says what's needed",
+              bridge.link_mode == "wifi" and "WLED Link build" in s["link"]["note"], s["link"])
+        wled.wll = {"v": 1, "mode": "wifi", "run": "wifi", "link": False, "ch": 6, "kf": "", "restore": True}
+        await ahttp("POST", "/__wledlink/api/rescan", b"{}")
+        check("the light gets the key", await until(lambda: wled.wll_key == bridge.link_key, 15), wled.wll)
+        s = await status()
+        check("...and waits until the radio link works", bridge.link_mode == "wifi")
+        bridge.link_up = True  # the light's usermod and the bridge now talk over ESP-NOW
+        await ahttp("POST", "/__wledlink/api/rescan", b"{}")
+        check("then switches to ESP-NOW by itself (the default)", await until(lambda: bridge.link_mode == "espnow", 15),
+              bridge.link_requests)
+        check("status shows the ESP-NOW link", await wait_for(lambda: _link_mode_is("espnow"), 10, "link status"))
+        code, _, body = await ahttp("POST", "/__wledlink/api/link", json.dumps({"mode": "wifi"}).encode())
+        check("the toggle switches back to Wi-Fi", code == 200 and await until(lambda: bridge.link_mode == "wifi", 10), body)
+        rc = await cli("link")
+        check("'wledlink.py link' shows the choice", rc.returncode == 0 and "Chosen : Wi-Fi network" in rc.stdout, rc.stdout + rc.stderr)
+        old_key = bridge.link_key
+        bridge.link_key = os.urandom(16)  # as if the bridge had been reset
+        bridge.reboot()
+        check("a reset bridge gets the light's key back from the PC", await until(lambda: bridge.link_key == old_key, 20))
+        code, _, _ = await ahttp("POST", "/__wledlink/api/restore", json.dumps({"on": False}).encode())
+        check("'remember the look' can be switched off", code == 200 and wled.wll["restore"] is False)
+        bridge.link_up = False
+
         print("WLED firmware update")
         wled.state.update(on=True, bri=200, lor=2)
         firmware = os.path.join(HERE, "_fw_test.bin")
@@ -349,6 +380,16 @@ async def e2e():
               rc.returncode == 0 and wled.firmware_uploads == [150_001], (wled.firmware_uploads, rc.stdout + rc.stderr))
         check("after the restart the light gets its look back",
               wled.state.get("bri") == 200 and wled.state.get("lor") == 2, wled.state)
+        wled.update_answers = False  # over ESP-NOW the light can restart before its answer is out
+        with open(firmware, "wb") as f:
+            f.write(bytes([0xE9]) + os.urandom(50_000))
+        try:
+            rc = await asyncio.wait_for(cli("wled-update", firmware), 60)
+        finally:
+            os.remove(firmware)
+        wled.update_answers = True
+        check("an update the light restarts from before answering still counts",
+              rc.returncode == 0 and wled.firmware_uploads[-1] == 50_001 and "Done" in rc.stdout, rc.stdout + rc.stderr)
 
         print("stopping")
         rc = await cli("run", "--port", "socket://127.0.0.1:1")
@@ -433,6 +474,11 @@ async def cli(*args):
     """Runs a wledlink.py command without blocking the event loop the fakes live on."""
     cmd = [sys.executable, os.path.join(HERE, "..", "wledlink.py"), "--listen", LISTEN, "--http-port", str(HTTP_PORT), *args]
     return await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=30)
+
+
+async def _link_mode_is(mode):
+    s = await status()
+    return s["link"].get("mode") == mode
 
 
 async def _no_wled():

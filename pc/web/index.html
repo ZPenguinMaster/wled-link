@@ -252,6 +252,13 @@ code { font-family: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospac
 
       <section class="card list">
         <div class="list-head"><span class="ico" style="background:#8e8e93"><svg><use href="#i-gear"/></svg></span>Settings</div>
+        <div class="row"><span class="k">Connection to the light<br><small style="color:var(--faint)" id="linkHint">—</small></span>
+          <select class="select" id="linkMode">
+            <option value="espnow">ESP-NOW, no network</option>
+            <option value="wifi">Wi-Fi network</option>
+          </select></div>
+        <div class="row"><span class="k">Remember the look<br><small style="color:var(--faint)">Comes back the same after a power cut</small></span>
+          <label class="switch"><input type="checkbox" id="restore"><span></span></label></div>
         <div class="row"><span class="k">Instant changes<br><small style="color:var(--faint)">No fade, also in WLED's own page</small></span>
           <label class="switch"><input type="checkbox" id="instant"><span></span></label></div>
         <div class="row"><span class="k">WLED backup hotspot</span>
@@ -280,6 +287,7 @@ code { font-family: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospac
         <div class="row"><span class="k">Bridge memory</span><span class="v" id="dMem">—</span></div>
         <div class="row"><span class="k">Colour frames</span><span class="v" id="dUdp">—</span></div>
         <div class="row"><span class="k">Link errors</span><span class="v" id="dErr">—</span></div>
+        <div class="row" id="dRadioRow" style="display:none"><span class="k">Radio link</span><span class="v" id="dRadio">—</span></div>
         <div class="row"><span class="k">WLED</span><span class="v" id="dWled">—</span></div>
       </details>
     </aside>
@@ -380,10 +388,12 @@ function render() {
 
   // setup assistant
   const joined = s && s.stations && s.stations.length > 0;
+  const lk = (s && s.link) || {};
   const steps = [
     {done: ready, title: "Plug in the bridge", text: "Connect the bridge ESP32 to this PC with a USB data cable."},
     {done: ready && joined, title: "Connect the light to the bridge",
-     text: ready ? `In WLED's Wi-Fi settings, type the network <code>${esc(b.ssid)}</code> with password <code>${esc(b.password)}</code>${b.hidden ? " (it's hidden, so type the name)" : ""}.` : "WLED joins the bridge's own private Wi-Fi network."},
+     text: ready && lk.mode === "espnow" ? "The light and the bridge find each other over ESP-NOW. If this takes more than a minute, switch Connection to the light to Wi-Fi and set the light up there first."
+       : ready ? `In WLED's Wi-Fi settings, type the network <code>${esc(b.ssid)}</code> with password <code>${esc(b.password)}</code>${b.hidden ? " (it's hidden, so type the name)" : ""}.` : "WLED joins the bridge's own private Wi-Fi network."},
     {done: !!w, title: "Wait for the light to answer", text: "This takes a few seconds after it joins."},
   ];
   const current = steps.findIndex((x) => !x.done);
@@ -392,9 +402,11 @@ function render() {
 
   // connection card
   $("rBridge").textContent = ready ? `Connected on ${b.port}` : b.state === "handshake" ? "Starting…" : b.state === "paused" ? "Paused for flashing" : "Not found";
-  $("rNet").innerHTML = b.ssid ? `${esc(b.ssid)}${b.hidden ? " · hidden" : ""} · ch ${esc(b.channel)}` : "—";
+  $("rNet").innerHTML = lk.mode === "espnow" ? `ESP-NOW · no network · ch ${esc(b.channel)}`
+    : b.ssid ? `${esc(b.ssid)}${b.hidden ? " · hidden" : ""} · ch ${esc(b.channel)}` : "—";
   const st = s && s.stations && s.stations[0];
-  $("rSignal").textContent = st ? `${st.rssi} dBm${w && w.signal != null ? ` · ${w.signal}%` : ""}` : "—";
+  $("rSignal").textContent = lk.mode === "espnow" ? (lk.up ? "Linked" : "Not linked")
+    : st ? `${st.rssi} dBm${w && w.signal != null ? ` · ${w.signal}%` : ""}` : "—";
   $("rAddr").innerHTML = s ? `${esc(s.listen)}<button class="copy" data-copy="${esc(s.listen)}" title="Copy"><svg><use href="#i-copy"/></svg></button>` : "—";
 
   // phone card
@@ -408,6 +420,17 @@ function render() {
   }
 
   // settings
+  const linkSel = $("linkMode");
+  linkSel.disabled = !lk.supported;
+  if (document.activeElement !== linkSel && lk.desired) linkSel.value = lk.desired;
+  $("linkHint").textContent = !lk.supported ? "Update the bridge to use ESP-NOW"
+    : lk.note ? lk.note
+    : lk.mode !== lk.desired ? "Switching…"
+    : lk.mode === "espnow" ? (lk.up ? "Linked. Nothing on the air but the link itself" : "Looking for the light")
+    : "The bridge's hidden Wi-Fi network is on the air";
+  const restore = $("restore");
+  restore.disabled = !lk.wledBuild;
+  if (document.activeElement !== restore && lk.restore != null) restore.checked = !!lk.restore;
   const ws = (w && w.settings) || {};
   const instant = $("instant");
   instant.disabled = !ws.readable;
@@ -427,6 +450,10 @@ function render() {
   $("dMem").textContent = b.freeHeap ? `${Math.round(b.freeHeap / 1024)} KB free` + (b.minFreeHeap ? ` · lowest ${Math.round(b.minFreeHeap / 1024)} KB` : "") : "—";
   $("dUdp").textContent = t.udp_forwarded != null ? `${t.udp_forwarded.toLocaleString()} sent` + (t.udpQueueDrops ? ` · ${t.udpQueueDrops} skipped` : "") : "—";
   $("dErr").textContent = `${t.resyncs || 0} resyncs · ${t.serialBadFrames || 0} bad frames`;
+  const lf = lk.bridgeFrames || {};
+  $("dRadioRow").style.display = lk.mode === "espnow" ? "" : "none";  // ESP-NOW frames to the light, and their fate
+  $("dRadio").textContent = lf.sent != null ? `${lf.sent.toLocaleString()} frames · ${(lf.lost || 0).toLocaleString()} unanswered`
+    + (lf.stalls ? ` · ${lf.stalls} radio restarts` : "") : "—";
   $("dWled").textContent = w ? `v${w.version} · ${ws.autoWhiteName ? "white " + ws.autoWhiteName + ", " : ""}${ws.cctBlend != null ? "blend " + ws.cctBlend + "%" : ""}` : "—";
 }
 
@@ -534,6 +561,8 @@ $("pairBtn").addEventListener("click", async () => { pairUntil = Date.now() + 12
 $("forgetBtn").addEventListener("click", () => { if (confirm("Forget every paired phone? They'll need to pair again.")) post("/__wledlink/api/phone-forget"); });
 $("instant").addEventListener("change", (e) => post("/__wledlink/api/wled-transition", {instant: e.target.checked}));
 $("hotspot").addEventListener("change", (e) => { post("/__wledlink/api/wled-hotspot", {mode: e.target.value}); e.target.blur(); });
+$("linkMode").addEventListener("change", (e) => { post("/__wledlink/api/link", {mode: e.target.value}); e.target.blur(); });
+$("restore").addEventListener("change", (e) => post("/__wledlink/api/restore", {on: e.target.checked}));
 $("wifiForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   const f = e.target, b = (status && status.bridge) || {};

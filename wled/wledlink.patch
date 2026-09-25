@@ -1,8 +1,111 @@
 diff --git a/wled00/wled.cpp b/wled00/wled.cpp
-index 308c939..73efe12 100644
+index 308c939..1ff5024 100644
 --- a/wled00/wled.cpp
 +++ b/wled00/wled.cpp
-@@ -944,7 +944,11 @@ void WLED::handleConnection()
+@@ -31,6 +31,7 @@ void WLED::reset()
+   #endif
+   unsigned long dly = millis();
+   while (millis() - dly < 450) {
++    if (radioLinkPump) radioLinkPump();  // WLED Link: over ESP-NOW the response goes out from the loop, which stops here
+     yield();        // enough time to send response to client
+   }
+   applyBri();
+@@ -681,6 +682,27 @@ void WLED::initAP(bool resetAP)
+   apActive = true;
+ }
+ 
++#ifndef WLED_DISABLE_ESPNOW
++// WLED Link: QuickEspNow's stop() leaves its two queues behind and begin() makes new ones, so every
++// reconnect attempt lost ~1.2 KB (without its network WLED ran out of memory within minutes). And once
++// started on "the current channel" it ignores the channel given to any later begin().
++struct QuickEspNowReset : QuickEspNow {
++  static void beforeBegin(QuickEspNow& q, bool stopped) {
++    QueueHandle_t QuickEspNow::* tx = &QuickEspNowReset::tx_queue;
++    QueueHandle_t QuickEspNow::* rx = &QuickEspNowReset::rx_queue;
++    bool QuickEspNow::* follow = &QuickEspNowReset::followWiFiChannel;
++    if (stopped) {  // its tasks are gone and the radio was re-initialized since: nothing can use them now
++      if (q.*tx) vQueueDelete(q.*tx);
++      if (q.*rx) vQueueDelete(q.*rx);
++      q.*tx = nullptr;
++      q.*rx = nullptr;
++    }
++    q.*follow = false;  // begin() sets it again when it is asked to follow the Wi-Fi channel
++  }
++};
++static bool espNowStopped = false;
++#endif
++
+ void WLED::initConnection()
+ {
+   DEBUG_PRINTF_P(PSTR("initConnection() called @ %lus.\n"), millis()/1000);
+@@ -693,6 +715,7 @@ void WLED::initConnection()
+     DEBUG_PRINTLN(F("ESP-NOW stopping."));
+     quickEspNow.stop();
+     statusESPNow = ESP_NOW_STATE_UNINIT;
++    espNowStopped = true;
+   }
+ #endif
+ 
+@@ -724,7 +747,15 @@ void WLED::initConnection()
+ 
+   lastReconnectAttempt = millis();
+ 
+-  if (!WLED_WIFI_CONFIGURED) {
++  if (espNowOnlyChannel) {  // WLED Link: talking to the bridge over ESP-NOW only, so no network and no access point
++    DEBUG_PRINTLN(F("ESP-NOW only (WLED Link)."));
++    WiFi.softAPdisconnect(true);
++    WiFi.mode(WIFI_STA);
++#ifdef ARDUINO_ARCH_ESP32
++    WiFi.setTxPower(wifi_power_t(txPower));
++    WiFi.setSleep(false);
++#endif
++  } else if (!WLED_WIFI_CONFIGURED) {
+     DEBUG_PRINTLN(F("No connection configured."));
+     if (!apActive) initAP();        // instantly go to ap mode
+   } else if (!apActive) {
+@@ -738,7 +769,7 @@ void WLED::initConnection()
+     }
+   }
+ 
+-  if (WLED_WIFI_CONFIGURED) {
++  if (WLED_WIFI_CONFIGURED && !espNowOnlyChannel) {
+     showWelcomePage = false;
+     
+     DEBUG_PRINTF_P(PSTR("Connecting to %s...\n"), multiWiFi[selectedWiFi].clientSSID);
+@@ -805,11 +836,15 @@ void WLED::initConnection()
+   }
+ 
+ #ifndef WLED_DISABLE_ESPNOW
+-  if (enableESPNow) {
++  if (enableESPNow || espNowOnlyChannel) {
++    QuickEspNowReset::beforeBegin(quickEspNow, espNowStopped);
++    espNowStopped = false;
+     quickEspNow.onDataSent(espNowSentCB);     // see udp.cpp
+     quickEspNow.onDataRcvd(espNowReceiveCB);  // see udp.cpp
+     bool espNowOK;
+-    if (apActive) {
++    if (espNowOnlyChannel) {
++      espNowOK = quickEspNow.begin(espNowOnlyChannel, WIFI_IF_STA);  // WLED Link: a fixed channel, the bridge's
++    } else if (apActive) {
+       DEBUG_PRINTLN(F("ESP-NOW initing in AP mode."));
+       #ifdef ESP32
+       quickEspNow.setWiFiBandwidth(WIFI_IF_AP, WIFI_BW_HT20); // Only needed for ESP32 in case you need coexistence with ESP8266 in the same network
+@@ -888,6 +923,14 @@ void WLED::handleConnection()
+   #endif
+   const bool wifiConfigured = WLED_WIFI_CONFIGURED;
+ 
++  if (espNowOnlyChannel) {  // WLED Link: no Wi-Fi network to look after
++    if (lastReconnectAttempt == 0 || forceReconnect) {
++      initConnection();
++      forceReconnect = false;
++    }
++    return;
++  }
++
+   // ignore connection handling if WiFi is configured and scan still running
+   // or within first 2s if WiFi is not configured or AP is always active
+   if ((wifiConfigured && multiWiFi.size() > 1 && WiFi.scanComplete() < 0) || (now < 2000 && (!wifiConfigured || apBehavior == AP_BEHAVIOR_ALWAYS)))
+@@ -944,7 +987,11 @@ void WLED::handleConnection()
        sendImprovStateResponse(0x03, true);
        improvActive = 2;
      }
@@ -16,7 +119,7 @@ index 308c939..73efe12 100644
        DEBUG_PRINTF_P(PSTR("Last reconnect (%lus) too old (@ %lus).\n"), lastReconnectAttempt/1000, nowS);
        if (++selectedWiFi >= multiWiFi.size()) selectedWiFi = 0; // we couldn't connect, try with another network from the list
 diff --git a/wled00/wled.h b/wled00/wled.h
-index 7f264a2..a95f1a5 100644
+index 7f264a2..1397e0d 100644
 --- a/wled00/wled.h
 +++ b/wled00/wled.h
 @@ -7,7 +7,7 @@
@@ -24,7 +127,30 @@ index 7f264a2..a95f1a5 100644
  
  // version code in format yymmddb (b = daily build)
 -#define VERSION 2605010
-+#define VERSION 2606301  // WLED Link build of 16.0.1 (official release: 2606300)
++#define VERSION 2606307  // WLED Link build of 16.0.1 (official release: 2606300)
  
  //uncomment this if you have a "my_config.h" file you'd like to use
  //#define WLED_USE_MY_CONFIG
+@@ -530,6 +530,8 @@ WLED_GLOBAL bool     serialCanTX _INIT(false);
+ 
+ #ifndef WLED_DISABLE_ESPNOW
+ WLED_GLOBAL bool enableESPNow        _INIT(false);  // global on/off for ESP-NOW
++WLED_GLOBAL byte espNowOnlyChannel   _INIT(0);      // WLED Link: when set, no Wi-Fi network or access point, only ESP-NOW on this channel
++WLED_GLOBAL void (*radioLinkPump)() _INIT(nullptr); // WLED Link: moves the web server's answers over the radio link (reset() calls it)
+ WLED_GLOBAL byte statusESPNow        _INIT(ESP_NOW_STATE_UNINIT); // state of ESP-NOW stack (0 uninitialised, 1 initialised, 2 error)
+ WLED_GLOBAL bool useESPNowSync       _INIT(false);  // use ESP-NOW wireless technology for sync
+ //WLED_GLOBAL char linked_remote[13]   _INIT("");     // MAC of ESP-NOW remote (Wiz Mote)
+diff --git a/wled00/wled_server.cpp b/wled00/wled_server.cpp
+index 0b4d0fb..62fb9ed 100644
+--- a/wled00/wled_server.cpp
++++ b/wled00/wled_server.cpp
+@@ -60,6 +60,9 @@ static bool inSubnet(const IPAddress &ip, const IPAddress &subnet, const IPAddre
+ }
+ 
+ static bool inSameSubnet(const IPAddress &client) {
++  // WLED Link: loopback is the PC, relayed by the usermod over its encrypted and authenticated radio link
++  // (in ESP-NOW mode WLED has no network address of its own to compare with)
++  if (client[0] == 127) return true;
+   return inSubnet(client, Network.localIP(), Network.subnetMask());
+ }
+ 

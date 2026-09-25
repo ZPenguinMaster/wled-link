@@ -1,6 +1,6 @@
 # build output (PlatformIO), except the ready-to-flash image
-bridge/.pio/
-bridge/.vscode/
+.pio/
+.vscode/
 
 # Python
 __pycache__/

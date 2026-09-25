@@ -46,6 +46,11 @@ class FakeBridge:
         self.light = {"on": 1, "bri": 128, "lor": 0, "live": 0, "ps": -1, "fx": 9, "cct": 127, "col": [255, 0, 0, 0]}
         self.light_seq = 0
         self.last_stream = 0.0   # like the real bridge, "live" follows the LED data it forwards
+        self.link_key = os.urandom(16)   # the radio link to the light (see bridge/src/link.cpp)
+        self.link_mode = "wifi"
+        self.link_set = False
+        self.link_up = False             # tests set this: whether the ESP-NOW link to the light works
+        self.link_requests = []
 
     async def start(self):
         self.server = await asyncio.start_server(self._on_host, "127.0.0.1", 0)
@@ -100,10 +105,11 @@ class FakeBridge:
         self._send_json(wl.B_INFO, {
             "proto": 1, "fw": "fake", "boot": f"{self.boot_id:08x}", "nonce": self.hello_nonce,
             "host": 1 if self.host_active else 0, "mac": "de:ad:be:ef:00:01", "wifi": 1, "ssid": "WLEDLink",
-            "pass": "quartz-basil-1769", "ch": 6, "chCfg": 0, "hidden": 1, "txq": 34, "withPc": 0, "caps": "ws,baud,phone", "apIp": "192.168.77.1",
+            "pass": "quartz-basil-1769", "ch": 6, "chCfg": 0, "hidden": 1, "txq": 34, "withPc": 0, "caps": "ws,baud,phone,espnow", "apIp": "192.168.77.1",
             "maxConns": MAX_CONNS, "win": WINDOW, "uptime": 1, "heap": 150000, "minHeap": 120000, "sta": len(self.stations),
             "udpTx": self.udp_sent, "udpDrop": 0, "rxBad": 0, "rxGaps": self.gaps, "tcpOpened": 0,
-            "phones": 1, "phonePin": "482913", "pairing": 0})
+            "phones": 1, "phonePin": "482913", "pairing": 0, "link": self.link_mode, "linkSet": int(self.link_set),
+            "lkf": wl.key_fingerprint(self.link_key), "linkUp": int(self.link_up)})
 
     def _send_sta_list(self):
         self._send_json(wl.B_STA_LIST, {"sta": self.stations})
@@ -182,7 +188,23 @@ class FakeBridge:
             self._send_sta_list()
         elif ftype == wl.H_STATS_REQ:
             self._send_json(wl.B_STATS, {"uptime": 5, "heap": 150000, "minHeap": 120000, "sta": len(self.stations), "udpTx": self.udp_sent,
-                                             "phones": 1, "phonePin": "482913", "pairing": 0})
+                                             "phones": 1, "phonePin": "482913", "pairing": 0, "linkUp": int(self.link_up)})
+        elif ftype == wl.H_LINK_KEY_REQ:
+            self._send(wl.B_LINK_KEY, self.link_key)
+        elif ftype == wl.H_SET_LINK:
+            self.link_requests.append(bytes(p))
+            if len(p) >= 17:
+                self.link_key = bytes(p[1:17])
+            mode = {0: "espnow", 1: "wifi"}.get(p[0])
+            if mode is None:
+                self._send_json(wl.B_CONFIG_RESULT, {"ok": True, "msg": "key saved"})
+            elif mode == self.link_mode:
+                self.link_set = True
+                self._send_json(wl.B_CONFIG_RESULT, {"ok": True, "msg": "saved"})
+            else:
+                self.link_mode, self.link_set = mode, True
+                self._send_json(wl.B_CONFIG_RESULT, {"ok": True, "msg": "switching, restarting"})
+                asyncio.get_running_loop().call_later(0.3, self.reboot)
         elif ftype == wl.H_SET_CONFIG:
             self.config_payloads.append(bytes(p))
             self._send_json(wl.B_CONFIG_RESULT, {"ok": True, "msg": "saved, rebooting"})

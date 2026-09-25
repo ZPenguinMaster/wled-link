@@ -11,6 +11,7 @@
 
 static const size_t RX_MAX = 8192;         // WLED's state+info push is ~3 KB
 static const size_t CMD_MAX = 512;
+static const size_t LINK_STATE_MAX = 255;  // the usermod's state report (about 130 bytes)
 static const uint32_t PING_EVERY_MS = 10000;
 static const uint32_t SILENT_LIMIT_MS = 25000;  // no data (not even a pong) for this long = dead connection
 static const uint32_t PROBE_TIMEOUT_MS = 2000;  // after a device joins or leaves the Wi-Fi, WLED must answer a ping by then
@@ -43,6 +44,10 @@ static uint32_t lastRxMs = 0, lastPingMs = 0, lastTryMs = 0;
 static Cmd lastCmd;          // resent once if WLED was too busy to take it
 static bool retryUsed = true;
 static volatile bool probeWanted = false;
+static bool overLink = false;             // ESP-NOW mode: WLED is reached through the radio link
+static volatile bool linkIsUp = false;
+static QueueHandle_t linkCmds = nullptr;  // commands for main.cpp to send over the link
+static QueueHandle_t linkStates = nullptr;
 static uint32_t probeSentMs = 0;          // 0 = no probe waiting for an answer
 static volatile uint32_t lastStreamMs = 0;  // 0 = no stream yet
 
@@ -350,6 +355,14 @@ static void applyCommand(const Cmd& cmd) {
     s.on = 1;  // WLED turns on when given a brightness
   publish(s);
 
+  if (overLink) {
+    if (xQueueSend(linkCmds, &cmd, 0) != pdTRUE) {  // full: the newest wins
+      Cmd old;
+      xQueueReceive(linkCmds, &old, 0);
+      xQueueSend(linkCmds, &cmd, 0);
+    }
+    return;
+  }
   if (sock < 0) connectWs();
   lastCmd = cmd;
   retryUsed = false;
@@ -369,14 +382,45 @@ static void trackStream() {
   publish(s);
 }
 
+// WLED's usermod pushes its state over the radio link at once, in both modes (the WebSocket waits a second).
+static void drainLinkStates() {
+  static char st[LINK_STATE_MAX + 1];
+  while (xQueueReceive(linkStates, st, 0) == pdTRUE) {
+    size_t n = strnlen(st, LINK_STATE_MAX);
+    const char* from = findKey(st, st + n, "\"state\":{");
+    if (!from) continue;
+    State s = snapshot();
+    readState(from, st + n, s);
+    s.fromWled = true;
+    publish(s);
+  }
+}
+
+// ESP-NOW mode: no WebSocket; commands go out through main.cpp's radio link.
+static void linkTask() {
+  static Cmd cmd;
+  if (xQueueReceive(cmds, &cmd, pdMS_TO_TICKS(5)) == pdTRUE) {
+    cmd.json[cmd.len] = 0;
+    applyCommand(cmd);
+  }
+  drainLinkStates();
+  setConnected(linkIsUp);
+  trackStream();
+}
+
 static void task(void*) {
   static Cmd cmd;
   for (;;) {
+    if (overLink) {
+      linkTask();
+      continue;
+    }
     if (sock < 0 && millis() - lastTryMs > RETRY_MS) connectWs();
     if (xQueueReceive(cmds, &cmd, pdMS_TO_TICKS(sock >= 0 ? 2 : 50)) == pdTRUE) {
       cmd.json[cmd.len] = 0;
       applyCommand(cmd);
     }
+    drainLinkStates();
     trackStream();
     if (sock < 0) continue;
     if (probeWanted) {
@@ -403,9 +447,12 @@ static void task(void*) {
 
 // ---------------------------------------------------------------------------------------------
 
-void wledBegin() {
+void wledBegin(bool viaLink) {
+  overLink = viaLink;
   rx = (uint8_t*)malloc(RX_MAX + 1);
   cmds = xQueueCreate(8, sizeof(Cmd));
+  linkCmds = xQueueCreate(8, sizeof(Cmd));
+  linkStates = xQueueCreate(4, LINK_STATE_MAX + 1);
   xTaskCreatePinnedToCore(task, "wled", 8192, nullptr, 2, nullptr, 1);
 }
 
@@ -425,6 +472,27 @@ uint32_t wledStateSeq() { return seq; }
 bool wledConnected() { return connected; }
 void wledNoteStream() { lastStreamMs = millis() | 1; }  // | 1: 0 means "no stream yet"
 void wledCheckLink() { probeWanted = true; }
+
+size_t wledTakeLinkCmd(char* out, size_t cap) {
+  Cmd cmd;
+  if (!linkCmds || xQueueReceive(linkCmds, &cmd, 0) != pdTRUE || cmd.len > cap) return 0;
+  memcpy(out, cmd.json, cmd.len);
+  return cmd.len;
+}
+
+void wledLinkState(const char* json, size_t len) {
+  if (!linkStates || len > LINK_STATE_MAX) return;
+  char buf[LINK_STATE_MAX + 1];
+  memcpy(buf, json, len);
+  buf[len] = 0;
+  if (xQueueSend(linkStates, buf, 0) != pdTRUE) {  // full: keep the newest
+    char old[LINK_STATE_MAX + 1];
+    xQueueReceive(linkStates, old, 0);
+    xQueueSend(linkStates, buf, 0);
+  }
+}
+
+void wledLinkUp(bool up) { linkIsUp = up; }
 
 size_t wledStateJson(char* out, size_t cap) {
   State s = snapshot();
