@@ -38,6 +38,8 @@ static NimBLEServer* server = nullptr;
 static NimBLECharacteristic* stateChr = nullptr;
 // diagnostics: times advertising had to be restarted, pairings refused
 static volatile uint32_t advRestarts = 0, refused = 0;
+static volatile uint32_t passkeyAt = 0;  // when a new pairing last asked for the PIN
+static volatile uint8_t lastRefusal = 0; // bits: 1 encrypted, 2 authenticated, 4 new pairing, 8 pairing was open
 static portMUX_TYPE listMux = portMUX_INITIALIZER_UNLOCKED;  // phones[] and links[] are shared with the BLE task
 
 // ---------------------------------------------------------------------------------------------
@@ -147,21 +149,30 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     NimBLEDevice::startAdvertising();  // findable again (phoneLoop checks too)
   }
 
-  uint32_t onPassKeyRequest() override { return pin; }
+  // Only a new pairing asks for the PIN; a phone coming back encrypts with the pairing it already has.
+  uint32_t onPassKeyRequest() override {
+    passkeyAt = millis() | 1;
+    return pin;
+  }
 
+  // A phone that comes back is recognised by its pairing, not its address: iPhones change their Bluetooth
+  // address all the time, and matching addresses turned returning phones away (and deleted their pairing).
+  // The bridge only keeps pairings made while pairing was open, so an encrypted, PIN-authenticated link on
+  // an existing pairing is one of ours; a new pairing needs the pairing window.
   void onAuthenticationComplete(ble_gap_conn_desc* desc) override {
-    bool ok = desc->sec_state.encrypted && desc->sec_state.authenticated;
-    if (ok && !known(desc->peer_id_addr)) {
-      if (phonePairingLeft() > 0) {
-        addPhone(desc->peer_id_addr);
-        pairingUntil = 0;  // one phone per window
-      } else {
-        ok = false;  // right PIN, but pairing wasn't open
-      }
+    bool secure = desc->sec_state.encrypted && desc->sec_state.authenticated;
+    bool fresh = passkeyAt && millis() - passkeyAt < 30000;
+    passkeyAt = 0;
+    bool open = phonePairingLeft() > 0;
+    bool ok = secure && (!fresh || open);
+    if (ok && fresh) {
+      addPhone(desc->peer_id_addr);
+      pairingUntil = 0;  // one phone per window
     }
     if (!ok) {
       refused++;
-      NimBLEDevice::deleteBond(NimBLEAddress(desc->peer_id_addr));
+      lastRefusal = (desc->sec_state.encrypted ? 1 : 0) | (desc->sec_state.authenticated ? 2 : 0) | (fresh ? 4 : 0) | (open ? 8 : 0);
+      if (fresh) NimBLEDevice::deleteBond(NimBLEAddress(desc->peer_id_addr));  // a pairing we didn't want
       server->disconnect(desc->conn_handle);
       return;
     }
@@ -296,11 +307,13 @@ bool phoneSetPin(uint32_t newPin) {
 uint32_t phonePin() { return pin; }
 
 int phoneDiag(char* out, size_t cap) {
-  int conns = server ? (int)server->getConnectedCount() : 0;
+  if (!server) return snprintf(out, cap, "off");  // Bluetooth not started yet
+  int conns = (int)server->getConnectedCount();
   bool adv = NimBLEDevice::getAdvertising()->isAdvertising();
-  return snprintf(out, cap, "c%d a%d r%lu x%lu", conns, adv ? 1 : 0, (unsigned long)advRestarts, (unsigned long)refused);
+  return snprintf(out, cap, "c%d a%d r%lu x%lu/%u b%d", conns, adv ? 1 : 0, (unsigned long)advRestarts, (unsigned long)refused,
+                  lastRefusal, NimBLEDevice::getNumBonds());
 }
-int phoneCount() { return numPhones; }
+int phoneCount() { return server ? NimBLEDevice::getNumBonds() : numPhones; }  // the pairings are what counts (once Bluetooth runs)
 
 int phonePairingLeft() {
   uint32_t until = pairingUntil;
