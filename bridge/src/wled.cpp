@@ -473,6 +473,17 @@ bool wledSend(const char* json, size_t len) {
 }
 
 uint32_t wledStateSeq() { return seq; }
+
+uint32_t wledAddress() {  // Wi-Fi mode: the light's address, for the phone's connections to its web page
+  uint32_t ip = wledIp;
+  if (ip) return ip;
+  wifi_sta_list_t wifiList;  // not looked up yet: the first device on the network is the light
+  esp_netif_sta_list_t ipList;
+  if (esp_wifi_ap_get_sta_list(&wifiList) == ESP_OK && esp_netif_get_sta_list(&wifiList, &ipList) == ESP_OK)
+    for (int i = 0; i < ipList.num; i++)
+      if (ipList.sta[i].ip.addr) return ipList.sta[i].ip.addr;
+  return 0;
+}
 void wledNoteStream() { lastStreamMs = millis() | 1; }  // | 1: 0 means "no stream yet"
 void wledCheckLink() { probeWanted = true; }
 
@@ -502,7 +513,7 @@ size_t wledStateJson(char* out, size_t cap) {
   State s = snapshot();
   int n = snprintf(out, cap,
       "{\"n\":%lu,\"ws\":%d,\"ok\":%d,\"on\":%d,\"bri\":%d,\"lor\":%d,\"live\":%d,\"ps\":%d,\"fx\":%d,\"cct\":%d,"
-      "\"col\":[%d,%d,%d,%d]}",
+      "\"col\":[%d,%d,%d,%d],\"tn\":1}",
       (unsigned long)seq, connected ? 1 : 0, s.fromWled ? 1 : 0, s.on, s.bri, s.lor, s.live, s.ps, s.fx, s.cct,
       s.col[0], s.col[1], s.col[2], s.col[3]);
   return n > 0 && (size_t)n < cap ? n : 0;

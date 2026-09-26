@@ -26,7 +26,7 @@
 #include "phone.h"
 #include "wled.h"
 
-#define FW_VERSION "1.5.0"
+#define FW_VERSION "1.6.0"
 static const uint8_t PROTO_VERSION = 1;
 
 enum MsgType : uint8_t {
@@ -44,6 +44,7 @@ enum MsgType : uint8_t {
   H_SET_BAUD = 0x0C,        // rate(4 LE): answered with BAUD, then the bridge switches speed
   H_SET_LINK = 0x0D,        // mode(1: 0 ESP-NOW, 1 Wi-Fi, 0xFF keep) [key(16)]: answered with CONFIG_RESULT
   H_LINK_KEY_REQ = 0x0E,    // answered with LINK_KEY
+  H_TUNNEL_TEST = 0x0F,     // bytes for the phone's tunnel, as if a phone wrote them (testing its path from the PC)
   H_TCP_OPEN = 0x10,        // conn(1) ip(4) port(2 BE)
   H_TCP_DATA = 0x11,        // conn(1) data
   H_TCP_CLOSE = 0x12,       // conn(1): flush what is pending, then close
@@ -57,9 +58,13 @@ enum MsgType : uint8_t {
   B_WLED_STATE = 0x88,      // JSON: the light's state, sent whenever it changes
   B_BAUD = 0x89,            // ok(1) rate(4 LE)
   B_LINK_KEY = 0x8A,        // key(16), or nothing if there is none yet
+  B_TUNNEL_TEST = 0x8B,     // what the tunnel sends back to that "phone"
   // bridge -> WLED over the radio link only
-  L_RESET = 0x42,           // the PC's session ended: close every connection
+  L_RESET = 0x42,           // [mask(1)]: close these connections (bit per connection; none given: all of them)
   L_MODE = 0x43,            // mode(1) channel(1): about to switch, follow now
+  L_CREDIT = 0x44,          // conn(1) bytes(2 LE): the phone took this much of a connection's data; WLED may send more
+  // phone -> bridge over the tunnel only (phone.h)
+  P_RESET = 0x13,           // forget every connection: the page started over (echoed back once done)
   B_TCP_OPEN_RESULT = 0x90, // conn(1) status(1)
   B_TCP_DATA = 0x91,        // conn(1) data
   B_TCP_CLOSED = 0x92,      // conn(1) reason(1); only after this may the host reuse the slot
@@ -67,12 +72,19 @@ enum MsgType : uint8_t {
 };
 
 enum OpenStatus : uint8_t { OPEN_OK = 0, OPEN_BAD_SLOT = 1, OPEN_NO_SOCKET = 2, OPEN_REFUSED = 3, OPEN_TIMEOUT = 4 };
-enum CloseReason : uint8_t { CLOSE_PEER = 0, CLOSE_ERROR = 1, CLOSE_HOST = 2, CLOSE_OVERFLOW = 3 };
+// CLOSE_RESET: WLED's usermod confirming an L_RESET for a phone connection (never reaches the phone)
+enum CloseReason : uint8_t { CLOSE_PEER = 0, CLOSE_ERROR = 1, CLOSE_HOST = 2, CLOSE_OVERFLOW = 3, CLOSE_RESET = 4 };
 
 static const size_t MAX_PAYLOAD = 1600;
 static const size_t MAX_FRAME = MAX_PAYLOAD + 4;                   // type + seq + payload + crc
 static const size_t MAX_ENCODED = MAX_FRAME + MAX_FRAME / 254 + 2;
 static const int MAX_CONNS = 6;            // browsers use at most 6 per site; each can hold ~6 KB of lwIP buffers
+// Connections 0-5 are the PC's (over USB), 6-7 the phone page's (over Bluetooth, phone.h). Answers go back to
+// whichever side opened the connection.
+static const int PHONE_BASE = MAX_CONNS;
+static const int ALL_CONNS = MAX_CONNS + PHONE_SLOTS;
+static const uint8_t PC_CONNS = (1 << MAX_CONNS) - 1;
+static const uint8_t PHONE_CONNS = ((1 << PHONE_SLOTS) - 1) << PHONE_BASE;
 static const size_t CONN_WINDOW = 4096;    // unacknowledged host->WLED bytes allowed per connection
 static const size_t LINK_WINDOW = 2048;    // the same, in ESP-NOW mode (WLED's usermod holds it)
 static const char* LINK_WLED_IP = "192.168.77.2";  // how WLED shows up to the PC in ESP-NOW mode
@@ -237,12 +249,12 @@ struct Conn {
   ConnState state;
   int sock;
   uint32_t since;
-  uint8_t* pending;  // host->WLED bytes the socket has not accepted yet (<= CONN_WINDOW)
+  uint8_t* pending;  // host->WLED bytes the socket has not accepted yet (<= CONN_WINDOW); only when needed
   size_t pendingLen;
   size_t ackOwed;
 };
 
-static Conn conns[MAX_CONNS];
+static Conn conns[ALL_CONNS];
 static int udpSock = -1;
 static Stats stats;
 static uint32_t bootId = 0;
@@ -265,7 +277,11 @@ static uint8_t sockBuf[TCP_CHUNK];
 
 static void apStart();  // Wi-Fi section below
 static bool espnow() { return linkMode() == LINK_ESPNOW; }
-static uint8_t relayed = 0;  // ESP-NOW mode: connections the PC has open through WLED's usermod (bit per slot)
+static uint8_t relayed = 0;    // ESP-NOW mode: connections open through WLED's usermod (bit per connection)
+static uint8_t resetting = 0;  // phone connections forgotten, until WLED confirms (what it sends before is stale)
+static uint8_t resetDue = 0;   // ... and the L_RESET that tells it still has to go out (the link was full)
+static uint32_t resetAt = 0;   // (a confirmation that never comes is given up on after a while)
+static uint32_t phoneEpoch = 0;
 
 static uint32_t serialBaud = WL_SERIAL_BAUD;
 static uint32_t baudTrialUntil = 0;  // a new speed is kept only if the host is heard at it by then
@@ -316,7 +332,7 @@ static void sendInfo() {
   int n = snprintf(buf, sizeof buf,
       "{\"proto\":%u,\"fw\":\"%s\",\"boot\":\"%08lx\",\"nonce\":%lu,\"host\":%d,"
       "\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"wifi\":%d,\"ssid\":\"%s\",\"pass\":\"%s\","
-      "\"ch\":%u,\"chCfg\":%u,\"hidden\":%u,\"txq\":%u,\"withPc\":%u,\"caps\":\"ws,baud,phone,espnow\",\"apIp\":\"%s\",\"maxConns\":%d,\"win\":%u,"
+      "\"ch\":%u,\"chCfg\":%u,\"hidden\":%u,\"txq\":%u,\"withPc\":%u,\"caps\":\"ws,baud,phone,espnow,tunnel\",\"apIp\":\"%s\",\"maxConns\":%d,\"win\":%u,"
       "\"link\":\"%s\",\"linkSet\":%d,\"lkf\":\"%s\",%s}",
       PROTO_VERSION, FW_VERSION, (unsigned long)bootId, (unsigned long)helloNonce, hostActive ? 1 : 0,
       mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], apOn ? 1 : 0, ssid, pass,
@@ -374,10 +390,13 @@ static void sendConfigResult(bool ok, const char* msg) {
   sendFrame(B_CONFIG_RESULT, buf, n);
 }
 
-static void sendOpenResult(uint8_t cid, uint8_t status) {
-  uint8_t p[2] = {cid, status};
-  sendFrame(B_TCP_OPEN_RESULT, p, 2);
+// A connection's answer (B_TCP_*: cid, then the rest) to whoever opened it: the PC or the phone.
+static void connReply(uint8_t type, uint8_t cid, const void* d, size_t n) {
+  if (cid >= PHONE_BASE) phoneTunnelSend(type, cid - PHONE_BASE, (const uint8_t*)d, n);
+  else sendFrame(type, &cid, 1, d, n);
 }
+
+static void sendOpenResult(uint8_t cid, uint8_t status) { connReply(B_TCP_OPEN_RESULT, cid, &status, 1); }
 
 // ---------------------------------------------------------------------------------------------
 // tunnelled connections
@@ -387,19 +406,20 @@ static void connFree(int cid) {
   if (c.sock >= 0) lwip_close(c.sock);
   c.sock = -1;
   c.state = C_FREE;
+  free(c.pending);
+  c.pending = nullptr;
   c.pendingLen = 0;
   c.ackOwed = 0;
 }
 
 static void connClosed(int cid, uint8_t reason) {
   connFree(cid);
-  uint8_t p[2] = {(uint8_t)cid, reason};
-  sendFrame(B_TCP_CLOSED, p, 2);
+  connReply(B_TCP_CLOSED, cid, &reason, 1);
 }
 
-static void closeAllConns() {
-  for (int i = 0; i < MAX_CONNS; i++)
-    if (conns[i].state != C_FREE) connFree(i);
+static void closeConns(uint8_t mask) {  // silently: the side they belong to starts over
+  for (int i = 0; i < ALL_CONNS; i++)
+    if ((mask & (1 << i)) && conns[i].state != C_FREE) connFree(i);
 }
 
 static bool wouldBlock() { return errno == EAGAIN || errno == EWOULDBLOCK; }
@@ -407,10 +427,7 @@ static bool wouldBlock() { return errno == EAGAIN || errno == EWOULDBLOCK; }
 static void handleTcpOpen(const uint8_t* p, size_t n) {
   if (n < 7) return;
   uint8_t cid = p[0];
-  if (cid >= MAX_CONNS || !conns[cid].pending) {
-    sendOpenResult(cid, OPEN_BAD_SLOT);
-    return;
-  }
+  if (cid >= ALL_CONNS) return;
   // The host only reuses a slot after it saw TCP_CLOSED, so a busy slot here is a leftover.
   if (conns[cid].state != C_FREE) connFree(cid);
 
@@ -444,7 +461,7 @@ static void handleTcpOpen(const uint8_t* p, size_t n) {
 }
 
 static void handleTcpData(const uint8_t* p, size_t n) {
-  if (n < 1 || p[0] >= MAX_CONNS) return;
+  if (n < 1 || p[0] >= ALL_CONNS) return;
   uint8_t cid = p[0];
   Conn& c = conns[cid];
   if (c.state == C_FREE || c.state == C_CLOSING) return;  // stale data for a connection that is gone
@@ -468,12 +485,16 @@ static void handleTcpData(const uint8_t* p, size_t n) {
     connClosed(cid, CLOSE_OVERFLOW);
     return;
   }
+  if (!c.pending && !(c.pending = (uint8_t*)malloc(CONN_WINDOW))) {
+    connClosed(cid, CLOSE_ERROR);
+    return;
+  }
   memcpy(c.pending + c.pendingLen, d, len);
   c.pendingLen += len;
 }
 
 static void handleTcpClose(const uint8_t* p, size_t n) {
-  if (n < 1 || p[0] >= MAX_CONNS) return;
+  if (n < 1 || p[0] >= ALL_CONNS) return;
   uint8_t cid = p[0];
   Conn& c = conns[cid];
   if (c.state == C_FREE || c.state == C_CLOSING) return;
@@ -511,19 +532,33 @@ static void handleUdpSend(const uint8_t* p, size_t n) {
 // them from WLED itself; the answers come back through onLinkMessage().
 static void relayClosed(uint8_t cid, uint8_t reason) {
   relayed &= ~(1 << cid);
-  uint8_t p[2] = {cid, reason};
-  sendFrame(B_TCP_CLOSED, p, 2);
+  connReply(B_TCP_CLOSED, cid, &reason, 1);
 }
 
-static void relayCloseAll(uint8_t reason) {
-  for (uint8_t cid = 0; cid < MAX_CONNS; cid++)
-    if (relayed & (1 << cid)) relayClosed(cid, reason);
+static bool sendResets() {
+  if (!resetDue) return true;
+  if (!linkSendMsg(L_RESET, &resetDue, 1)) return false;
+  resetDue = 0;
+  return true;
+}
+
+// Forgets these connections on both ends without telling their owner (it starts over). For the phone's,
+// WLED's usermod confirms each with a "closed (reset)", and whatever it sent for them before is dropped.
+static void relayForget(uint8_t mask) {
+  mask &= relayed;
+  relayed &= ~mask;
+  uint8_t pc = mask & PC_CONNS, phone = mask & PHONE_CONNS;
+  if (pc) linkSendMsg(L_RESET, &pc, 1);
+  if (phone) resetAt = millis();
+  resetting |= phone;
+  resetDue |= phone;
+  sendResets();
 }
 
 static void relayOpen(const uint8_t* p, size_t n) {
   if (n < 7) return;
   uint8_t cid = p[0];
-  if (cid >= MAX_CONNS) return sendOpenResult(cid, OPEN_BAD_SLOT);
+  if (cid >= ALL_CONNS) return;
   if (!linkUp()) return sendOpenResult(cid, OPEN_REFUSED);
   if (!linkSendMsg(H_TCP_OPEN, p, n)) return sendOpenResult(cid, OPEN_NO_SOCKET);
   relayed |= 1 << cid;
@@ -531,8 +566,28 @@ static void relayOpen(const uint8_t* p, size_t n) {
 }
 
 static void relayConn(uint8_t type, const uint8_t* p, size_t n) {
-  if (n < 1 || p[0] >= MAX_CONNS || !(relayed & (1 << p[0]))) return;  // stale: that connection is gone
-  if (!linkSendMsg(type, p, n)) relayClosed(p[0], CLOSE_OVERFLOW);
+  if (n < 1 || p[0] >= ALL_CONNS || !(relayed & (1 << p[0]))) return;  // stale: that connection is gone
+  uint8_t cid = p[0];
+  if (linkSendMsg(type, p, n)) return;
+  if (cid >= PHONE_BASE) relayForget(1 << cid);  // (WLED's end must go too: the phone may reuse the slot)
+  relayClosed(cid, CLOSE_OVERFLOW);
+}
+
+// WLED's answers for the phone's connections. WLED only sends as much data as the phone has room for (it
+// gets L_CREDIT as the phone takes it), so it always fits; the link is never held up for the phone.
+static void relayToPhone(const uint8_t* m, size_t n) {
+  uint8_t cid = m[1], bit = 1 << cid;
+  if (resetting & bit) {  // left over from a connection the phone no longer has
+    if (m[0] == B_TCP_CLOSED && n >= 3 && m[2] == CLOSE_RESET) resetting &= ~bit;  // the last of it
+    return;
+  }
+  if (!(relayed & bit)) return;
+  if (m[0] == B_TCP_CLOSED || (m[0] == B_TCP_OPEN_RESULT && n >= 3 && m[2] != OPEN_OK)) relayed &= ~bit;
+  if (!phoneTunnelSend(m[0], cid - PHONE_BASE, m + 2, n - 2)) {
+    relayForget(bit);
+    uint8_t reason = CLOSE_OVERFLOW;
+    connReply(B_TCP_CLOSED, cid, &reason, 1);
+  }
 }
 
 bool onLinkMessage(const uint8_t* m, size_t n) {
@@ -542,7 +597,12 @@ bool onLinkMessage(const uint8_t* m, size_t n) {
     case B_TCP_DATA:
     case B_TCP_CLOSED:
     case B_TCP_ACK: {
-      if (!hostActive || n < 2 || m[1] >= MAX_CONNS || !(relayed & (1 << m[1]))) return true;  // nobody wants it
+      if (n < 2 || m[1] >= ALL_CONNS) return true;
+      if (m[1] >= PHONE_BASE) {
+        relayToPhone(m, n);
+        return true;
+      }
+      if (!(relayed & (1 << m[1])) || !hostActive) return true;  // nobody wants it
       if (Serial.availableForWrite() < (int)wireSize(n)) return false;  // USB is busy: WLED sends it again soon
       if (m[0] == B_TCP_CLOSED || (m[0] == B_TCP_OPEN_RESULT && n >= 3 && m[2] != OPEN_OK)) relayed &= ~(1 << m[1]);
       sendFrame(m[0], m + 1, n - 1);
@@ -565,14 +625,16 @@ void onLinkStall() {
 void onLinkChange(bool up) {
   wledLinkUp(up);
   staDirty = true;
-  if (!up && hostActive) relayCloseAll(CLOSE_ERROR);
-  if (!up) relayed = 0;
+  if (up) return;
+  for (uint8_t cid = 0; cid < ALL_CONNS; cid++)  // their other end is gone
+    if ((relayed & (1 << cid)) && (cid >= PHONE_BASE || hostActive)) relayClosed(cid, CLOSE_ERROR);
+  relayed = resetting = resetDue = 0;  // (the next session starts with nothing open at either end)
 }
 
-// Moves data between the sockets and the serial link. Returns true if anything happened.
+// Moves data between the sockets and the serial link (or the phone). Returns true if anything happened.
 static bool pumpConns() {
   bool busy = false;
-  for (int i = 0; i < MAX_CONNS; i++) {
+  for (int i = 0; i < ALL_CONNS; i++) {
     Conn& c = conns[i];
     if (c.state == C_FREE) continue;
 
@@ -618,8 +680,8 @@ static bool pumpConns() {
       }
     }
     if (c.ackOwed > 0) {
-      uint8_t ack[3] = {(uint8_t)i, (uint8_t)(c.ackOwed & 0xFF), (uint8_t)(c.ackOwed >> 8)};
-      sendFrame(B_TCP_ACK, ack, 3);
+      uint8_t ack[2] = {(uint8_t)(c.ackOwed & 0xFF), (uint8_t)(c.ackOwed >> 8)};
+      connReply(B_TCP_ACK, i, ack, 2);
       c.ackOwed = 0;
     }
 
@@ -629,14 +691,19 @@ static bool pumpConns() {
       continue;
     }
 
-    // WLED -> host, only as fast as the serial link drains
-    int room = Serial.availableForWrite();
-    if (room < (int)wireSize(64)) continue;
-    size_t want = min(TCP_CHUNK, (size_t)room - wireSize(1));
+    // WLED -> host (or phone), only as fast as that side drains
+    size_t want;
+    if (i >= PHONE_BASE) {
+      want = min(TCP_CHUNK, phoneTunnelRoom());
+      if (want < 64) continue;
+    } else {
+      int room = Serial.availableForWrite();
+      if (room < (int)wireSize(64)) continue;
+      want = min(TCP_CHUNK, (size_t)room - wireSize(1));
+    }
     int k = lwip_recv(c.sock, sockBuf, want, MSG_DONTWAIT);
     if (k > 0) {
-      uint8_t cid = i;
-      sendFrame(B_TCP_DATA, &cid, 1, sockBuf, k);
+      connReply(B_TCP_DATA, i, sockBuf, k);
       lastActivityMs = millis();
       busy = true;
     } else if (k == 0) {
@@ -651,13 +718,19 @@ static bool pumpConns() {
 // ---------------------------------------------------------------------------------------------
 // session
 
+static bool tunnelTestOut(const uint8_t* d, size_t n) {
+  if (!hostActive || Serial.availableForWrite() < (int)wireSize(n)) return false;
+  sendFrame(B_TUNNEL_TEST, d, n);
+  return true;
+}
+
 static void endSession() {
+  phoneTunnelTestEnd();
   hostActive = false;
   helloNonce = 0;
   rxExpectSeq = -1;
-  closeAllConns();
-  if (relayed) linkSendMsg(L_RESET, nullptr, 0);
-  relayed = 0;
+  closeConns(PC_CONNS);
+  relayForget(PC_CONNS);
   if (serialBaud != WL_SERIAL_BAUD) setBaud(WL_SERIAL_BAUD);  // beacons always go out at the default speed
 }
 
@@ -717,9 +790,8 @@ static void handleSetLink(const uint8_t* p, size_t n) {
 }
 
 static void handleHello(uint8_t seq, const uint8_t* p, size_t n) {
-  closeAllConns();  // the host starts with no connections, so neither do we
-  if (relayed) linkSendMsg(L_RESET, nullptr, 0);
-  relayed = 0;
+  closeConns(PC_CONNS);  // the host starts with no connections, so neither do we
+  relayForget(PC_CONNS);
   if (!espnow()) apStart();
   hostActive = true;
   rxExpectSeq = (seq + 1) & 0xFF;
@@ -788,9 +860,17 @@ static void handleFrame(const uint8_t* enc, size_t encLen) {
     }
     case H_SET_LINK: handleSetLink(p, len); break;
     case H_LINK_KEY_REQ: sendFrame(B_LINK_KEY, linkKey(), linkKey() ? 16 : 0); break;
-    case H_TCP_OPEN: espnow() ? relayOpen(p, len) : handleTcpOpen(p, len); break;
-    case H_TCP_DATA: espnow() ? relayConn(H_TCP_DATA, p, len) : handleTcpData(p, len); break;
-    case H_TCP_CLOSE: espnow() ? relayConn(H_TCP_CLOSE, p, len) : handleTcpClose(p, len); break;
+    case H_TUNNEL_TEST: phoneTunnelTest(p, len, tunnelTestOut); break;
+    case H_TCP_OPEN:
+      if (len && p[0] >= MAX_CONNS) {  // the phone's
+        uint8_t r[2] = {p[0], OPEN_BAD_SLOT};
+        sendFrame(B_TCP_OPEN_RESULT, r, 2);
+      } else {
+        espnow() ? relayOpen(p, len) : handleTcpOpen(p, len);
+      }
+      break;
+    case H_TCP_DATA: if (len && p[0] < MAX_CONNS) espnow() ? relayConn(H_TCP_DATA, p, len) : handleTcpData(p, len); break;
+    case H_TCP_CLOSE: if (len && p[0] < MAX_CONNS) espnow() ? relayConn(H_TCP_CLOSE, p, len) : handleTcpClose(p, len); break;
     case H_UDP_SEND: handleUdpSend(p, len); break;
     default: break;
   }
@@ -819,6 +899,74 @@ static bool pumpSerial() {
         rxOverflow = true;
       }
     }
+  }
+  return busy;
+}
+
+// ---------------------------------------------------------------------------------------------
+// the phone page's connections to WLED's web server (phone.h)
+
+static void closePhoneConns() {
+  closeConns(PHONE_CONNS);
+  relayForget(PHONE_CONNS);
+  phoneTunnelClear();
+}
+
+static void phoneOpen(uint8_t cid, uint16_t port) {
+  uint8_t p[7] = {cid, 0, 0, 0, 0, (uint8_t)(port >> 8), (uint8_t)port};
+  phoneTunnelCredited(cid - PHONE_BASE, UINT32_MAX);  // what the connection before it had coming is moot
+  if (espnow()) {  // WLED's usermod serves it from WLED itself: no address needed
+    relayForget(1 << cid);  // (a phone only reuses a closed one: this is a leftover)
+    if (!sendResets()) return sendOpenResult(cid, OPEN_NO_SOCKET);  // the reset must reach WLED first: try later
+    return relayOpen(p, sizeof p);
+  }
+  uint32_t ip = wledAddress();
+  if (!ip) return sendOpenResult(cid, OPEN_REFUSED);
+  memcpy(p + 1, &ip, 4);
+  handleTcpOpen(p, sizeof p);
+}
+
+// Messages from the phone's tunnel, and credit for WLED's usermod as the phone takes its data.
+static bool pumpPhone() {
+  static uint8_t m[2 + 1100];
+  bool busy = false;
+  if (resetDue) sendResets();
+  if (resetting && millis() - resetAt > 3000) resetting = 0;  // e.g. an older usermod, which doesn't confirm
+  for (int budget = 16; budget > 0; budget--) {
+    uint32_t epoch;
+    size_t n = phoneTunnelRead(m, sizeof m, &epoch);
+    if (epoch != phoneEpoch) {  // another phone took the tunnel over, or the phone left: its connections go
+      phoneEpoch = epoch;
+      closePhoneConns();
+    }
+    if (n < 2) break;
+    busy = true;
+    uint8_t type = m[0], slot = m[1];
+    if (type == P_RESET) {
+      closePhoneConns();
+      phoneTunnelSend(P_RESET, 0, nullptr, 0);  // done: what the phone gets after this is from its new connections
+      continue;
+    }
+    if (slot >= PHONE_SLOTS) continue;
+    uint8_t cid = PHONE_BASE + slot;
+    m[1] = cid;  // from here on the same messages as the PC's
+    const uint8_t* p = m + 1;
+    size_t len = n - 1;
+    switch (type) {
+      case H_TCP_OPEN: phoneOpen(cid, len >= 3 ? (p[1] << 8 | p[2]) : 80); break;
+      case H_TCP_DATA: espnow() ? relayConn(H_TCP_DATA, p, len) : handleTcpData(p, len); break;
+      case H_TCP_CLOSE: espnow() ? relayConn(H_TCP_CLOSE, p, len) : handleTcpClose(p, len); break;
+      default: break;
+    }
+  }
+  for (uint8_t s = 0; espnow() && s < PHONE_SLOTS; s++) {
+    uint8_t cid = PHONE_BASE + s;
+    bool idle = false;
+    uint32_t d = phoneTunnelDrained(s, &idle);
+    if (!d || !(relayed & (1 << cid)) || (d < 1024 && !idle)) continue;  // a few at a time, or all once it's through
+    uint16_t k = d > 0xFFFF ? 0xFFFF : d;
+    uint8_t cr[3] = {cid, (uint8_t)k, (uint8_t)(k >> 8)};
+    if (linkSendMsg(L_CREDIT, cr, sizeof cr)) phoneTunnelCredited(s, k);
   }
   return busy;
 }
@@ -941,7 +1089,7 @@ static void restartNow() {
   Serial.flush();
   if (udpSock >= 0) lwip_close(udpSock);
   udpSock = -1;
-  closeAllConns();
+  closeConns(0xFF);
   phoneEnd();
   linkStop();
   WiFi.mode(WIFI_OFF);
@@ -969,12 +1117,10 @@ void setup() {
   bootId = esp_random();
   loadSettings();
   linkLoad();
-  for (int i = 0; i < MAX_CONNS; i++) {
+  for (int i = 0; i < ALL_CONNS; i++) {
     conns[i].state = C_FREE;
     conns[i].sock = -1;
-    // only Wi-Fi mode connects to WLED from here; in ESP-NOW mode WLED's usermod holds the PC's data
-    // (switching modes restarts the bridge)
-    conns[i].pending = espnow() ? nullptr : (uint8_t*)malloc(CONN_WINDOW);
+    conns[i].pending = nullptr;
   }
   sendInfo();  // tells a connected PC straight away that the bridge restarted, rather than after its timeout
   setupWifi();
@@ -991,6 +1137,7 @@ void setup() {
 
 void loop() {
   bool busy = pumpSerial();
+  busy |= pumpPhone();
   busy |= pumpConns();
 
   uint32_t now = millis();

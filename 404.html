@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Lights</title>
+<style>
+html, body { margin: 0; height: 100%; background: #111; color: #f5f5f7; font: 17px -apple-system, system-ui, sans-serif; }
+p { margin: 40px 16px; }
+a { color: #0a84ff; }
+</style>
+</head>
+<body>
+<script>
+// GitHub Pages shows this for any address it has no file for. WLED's settings pages open at such addresses
+// (pc/phone/wled.html/settings/...) in the phone page's frame, and that page fetches them over Bluetooth.
+(function () {
+  var w = window, host = null;
+  try { while (!host && w.parent !== w) { w = w.parent; host = w.WLED_FRAME || null; } } catch (e) {}
+  if (host) {
+    host.load(location.href).then(function (html) {
+      document.open();
+      document.write(html);
+      document.close();
+    }, function (e) { host.failed(e); });
+    return;
+  }
+  var m = location.pathname.match(/^(.*?\/)pc\/phone\//);
+  var home = (m ? m[1] : "/" + location.pathname.split("/")[1] + "/") + "pc/phone/";
+  var p = document.createElement("p");
+  p.innerHTML = 'Nothing here. <a href="' + home + '">Open the light control</a>';
+  document.body.appendChild(p);
+})();
+</script>
+</body>
+</html>

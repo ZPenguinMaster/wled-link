@@ -88,6 +88,35 @@ main { max-width: 480px; margin: 0 auto; padding: max(18px, env(safe-area-inset-
 .primary[disabled] { opacity: .6; }
 .foot { text-align: center; margin-top: 18px; }
 .link { background: none; border: none; color: var(--accent); font-size: 15px; padding: 8px; }
+.link.quiet { color: var(--faint); font-size: 14px; }
+.row-btn { display: flex; align-items: center; gap: 14px; width: 100%; margin-top: 16px; padding: 14px 16px; border-radius: 22px; border: 1px solid var(--line); background: var(--surface); text-align: left; transition: transform .15s var(--ease); }
+.row-btn:active { transform: scale(.98); }
+.row-btn .icon { width: 40px; height: 40px; border-radius: 12px; display: grid; place-items: center; background: linear-gradient(135deg, #5e5ce6, #bf5af2); color: #fff; flex: none; }
+.row-btn .icon svg { width: 20px; height: 20px; }
+.row-btn b { display: block; font-weight: 600; }
+.row-btn small { display: block; color: var(--muted); font-size: 13px; }
+.row-btn .chev { margin-left: auto; color: var(--faint); width: 18px; height: 18px; }
+
+/* WLED's own page, in a sheet over everything */
+.sheet { position: fixed; inset: 0; z-index: 30; display: flex; flex-direction: column; background: #111; color: #f5f5f7; }
+.sheet-bar { position: relative; display: flex; align-items: center; height: calc(48px + env(safe-area-inset-top)); padding: env(safe-area-inset-top) 6px 0; background: #1a1a1c; border-bottom: 1px solid rgba(255,255,255,.08); flex: none; }
+.sheet-bar h3 { position: absolute; left: 0; right: 0; bottom: 0; height: 48px; margin: 0; display: grid; place-items: center; font: 600 17px/1 var(--display); pointer-events: none; }
+.sheet-bar button { position: relative; display: flex; align-items: center; gap: 2px; height: 40px; padding: 0 10px; border: none; background: none; color: #0a84ff; font-size: 17px; }
+.sheet-bar .end { margin-left: auto; }
+.sheet-bar svg { width: 22px; height: 22px; }
+.sheet-bar .busy { position: absolute; left: 0; right: 0; bottom: -1px; height: 2px; overflow: hidden; opacity: 0; transition: opacity .3s; }
+.sheet-bar .busy::after { content: ""; position: absolute; top: 0; bottom: 0; width: 30%; background: #0a84ff; animation: busy 1.1s ease-in-out infinite; }
+.sheet.working .sheet-bar .busy { opacity: 1; }
+@keyframes busy { from { left: -30%; } to { left: 100%; } }
+.sheet iframe { flex: 1; width: 100%; border: 0; background: #111; }
+.cover { position: absolute; left: 0; right: 0; bottom: 0; top: calc(48px + env(safe-area-inset-top)); display: grid; place-items: center; padding: 24px; background: #111; text-align: center; }
+.cover b { display: block; font-size: 19px; margin: 14px 0 6px; }
+.cover span { display: block; color: #8e8e96; font-size: 15px; max-width: 320px; margin: 0 auto; }
+.cover .primary { width: auto; height: 46px; padding: 0 22px; margin-top: 20px; font-size: 16px; }
+.spinner { width: 34px; height: 34px; margin: 0 auto; border-radius: 50%; border: 3px solid rgba(255,255,255,.15); border-top-color: #0a84ff; animation: spin .8s linear infinite; }
+.cover.failed .spinner { display: none; }
+@keyframes spin { to { transform: rotate(360deg); } }
+body.sheet-open { overflow: hidden; }
 .note { color: var(--muted); font-size: 13px; text-align: center; margin: 14px 8px 0; }
 .toast { position: fixed; left: 50%; bottom: max(24px, env(safe-area-inset-bottom)); transform: translate(-50%, 20px); width: max-content; max-width: calc(100vw - 32px); padding: 12px 18px; border-radius: 16px; background: rgba(40,40,46,.94); color: #fff; font-size: 15px; opacity: 0; pointer-events: none; transition: all .3s var(--ease); }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
@@ -107,6 +136,10 @@ main { max-width: 480px; margin: 0 auto; padding: max(18px, env(safe-area-inset-
   <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
   <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
   <symbol id="i-bt" viewBox="0 0 24 24"><path d="M7 7l10 10-5 5V2l5 5L7 17"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 20v-6M4 10V4M12 20v-8M12 8V4M20 20v-4M20 12V4M2 14h4M10 8h4M18 16h4"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></symbol>
 </svg>
 <main>
   <div class="top"><h1>Lights</h1><span class="pill" id="pill"><span class="dot"></span><span id="pillText">Not connected</span></span></div>
@@ -138,9 +171,29 @@ main { max-width: 480px; margin: 0 auto; padding: max(18px, env(safe-area-inset-
       <button class="tile" data-mode="cool"><span class="check"><svg><use href="#i-check"/></svg></span><span class="swatch cool"></span><span class="name">Cool</span><span class="sub">6000 K, full</span></button>
       <button class="tile" data-mode="warm"><span class="check"><svg><use href="#i-check"/></svg></span><span class="swatch warm"></span><span class="name">Warm</span><span class="sub">3000 K, full</span></button>
     </div>
-    <div class="foot"><button class="link" id="disconnect">Disconnect</button></div>
+    <button class="row-btn" id="wledOpen" hidden>
+      <span class="icon"><svg><use href="#i-sliders"/></svg></span>
+      <span><b>WLED</b><small>Effects, colours, palettes and presets</small></span>
+      <svg class="chev"><use href="#i-chev"/></svg>
+    </button>
+    <div class="foot"><button class="link quiet" id="disconnect">Disconnect</button></div>
   </section>
 </main>
+<div class="sheet" id="wledSheet" hidden>
+  <div class="sheet-bar">
+    <button id="wledBack"><svg><use href="#i-back"/></svg>Lights</button>
+    <h3>WLED</h3>
+    <button class="end" id="wledReload" aria-label="Reload"><svg><use href="#i-refresh"/></svg></button>
+    <div class="busy"></div>
+  </div>
+  <iframe id="wledFrame" title="WLED" sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-downloads"></iframe>
+  <div class="cover" id="wledCover"><div>
+    <div class="spinner"></div>
+    <b id="wledCoverTitle">Loading WLED…</b>
+    <span id="wledCoverText"></span>
+    <button class="primary" id="wledRetry" hidden>Try again</button>
+  </div></div>
+</div>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
 <script>
@@ -226,6 +279,7 @@ function render() {
   slider.classList.toggle("vivid", rainbow);
   if (!slider.classList.contains("dragging")) setSlider(on ? pct : 0, on ? pct + "%" : "Off");
   document.querySelectorAll(".tile").forEach((t) => { t.classList.toggle("active", t.dataset.mode === mode); t.disabled = mode === "unknown"; });
+  $("wledOpen").hidden = !(state.tn || tun.chr);  // bridges that can carry WLED's page say so ("tn")
 }
 
 function setSlider(p, text) {
@@ -264,9 +318,11 @@ async function flush() {
   }
 }
 function onState(value) {
+  const before = state.n;
   try { state = JSON.parse(new TextDecoder().decode(value)); } catch (e) { return; }
   try { localStorage.setItem("wl-state", JSON.stringify(state)); } catch (e) {}
   render();
+  if (state.n !== before) wledNoteChange();
 }
 async function attach(dev) {
   device = dev;
@@ -275,6 +331,7 @@ async function attach(dev) {
     dev._wl = true;
     dev.addEventListener("gattserverdisconnected", () => {
       cmdChr = stateChr = null;
+      tunDetach();
       linkState = "idle";
       render();
       if (wantConnected) retryTimer = setTimeout(reconnect, 150);
@@ -295,6 +352,7 @@ async function attach(dev) {
   hadLink = true;
   render();
   flush();  // what was tapped while connecting
+  tunAttach(svc);  // WLED's page (after the controls, so they are never kept waiting)
 }
 const withTimeout = (p, ms) => Promise.race([p, new Promise((_, no) => setTimeout(() => no(new Error("timed out")), ms))]);
 // A light remembered from before only connects once the browser has heard it advertise again.
@@ -400,6 +458,626 @@ function toast(text) {
   t.textContent = text; t.className = "toast show";
   clearTimeout(toastTimer); toastTimer = setTimeout(() => (t.className = "toast"), 4000);
 }
+
+// ---------- WLED's own page, over Bluetooth ----------
+// The bridge carries connections to WLED's web server over the TUNNEL characteristic (bridge/src/phone.h):
+// messages of type(1) slot(1) len(2 LE) payload, one byte stream each way. WLED's page runs in a frame whose
+// requests come through here; its files are kept on the phone, and only checked for changes.
+const TUNNEL = "8d2a0004-3c55-4b6e-a7f1-6f2b5c0e9a41";
+const TM = {OPEN: 0x10, DATA: 0x11, CLOSE: 0x12, RESET: 0x13, OPENED: 0x90, RDATA: 0x91, CLOSED: 0x92, ACK: 0x93};
+const TUN_SLOTS = 2, TUN_WINDOW = 2048, TUN_WRITE = 180;  // (writes fit the smallest MTU iPhones use)
+const OPEN_ERRORS = {1: "The light's firmware is too old for this. Update it from the PC (python wledlink.py wled-update).",
+  2: "The light is busy. Try again in a moment.", 3: "The bridge can't reach the light right now.", 4: "The light didn't answer."};
+// state: off (no Bluetooth link) | missing (no tunnel on this link) | syncing (reset sent, waiting for its echo) | ready
+const tun = {chr: null, state: "off", rx: new Uint8Array(0), out: [], writing: false, slots: [null, null], queue: [],
+             next: 0, used: 0, timer: 0};
+const enc = new TextEncoder(), dec = new TextDecoder();
+
+function join(parts) {
+  let n = 0;
+  for (const p of parts) n += p.length;
+  const out = new Uint8Array(n);
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+function find(buf, seq, from = 0) {
+  outer: for (let i = from; i <= buf.length - seq.length; i++) {
+    for (let k = 0; k < seq.length; k++) if (buf[i + k] !== seq[k]) continue outer;
+    return i;
+  }
+  return -1;
+}
+
+async function tunAttach(svc) {
+  let chr;
+  try {
+    chr = await svc.getCharacteristic(TUNNEL);
+    chr.addEventListener("characteristicvaluechanged", tunReceive);
+    await chr.startNotifications();
+  } catch (e) {
+    tun.state = "missing";  // an older bridge, or an iPhone still using the bridge's old layout
+    tunFailQueue(tunMissingError());
+    wledStatus();
+    return;
+  }
+  tun.chr = chr;
+  tun.rx = new Uint8Array(0);
+  tun.out = [];
+  render();
+  tunResync();
+}
+function tunDetach() {
+  tun.chr = null;
+  tun.out = [];
+  if (tun.state !== "missing") tun.state = "off";
+  for (let s = 0; s < TUN_SLOTS; s++) {
+    const job = tun.slots[s];
+    tun.slots[s] = null;
+    if (job) jobFail(job, new Error("Bluetooth disconnected"));
+  }
+  wledStatus();  // (queued requests wait for the next connection)
+}
+function tunMissingError() {
+  return new Error(state.tn ? "Your iPhone still has the bridge's old Bluetooth details. Close Bluefy completely and open it again; if that doesn't do it, forget Lamp in iPhone Settings > Bluetooth and pair again."
+    : "The bridge needs a firmware update for this (python wledlink.py flash-bridge on the PC).");
+}
+// Starts the stream over: every connection is dropped, and what arrives before the bridge's echo is stale.
+function tunResync() {
+  for (let s = 0; s < TUN_SLOTS; s++) {
+    const job = tun.slots[s];
+    tun.slots[s] = null;
+    if (job) jobFail(job, new Error("the connection to the light started over"));
+  }
+  tun.state = "syncing";
+  tun.rx = new Uint8Array(0);
+  tun.syncAt = Date.now();
+  tunSend(TM.RESET, 0);
+  tunWatch();
+}
+function tunSend(type, slot, payload = new Uint8Array(0)) {
+  const m = new Uint8Array(4 + payload.length);
+  m[0] = type; m[1] = slot; m[2] = payload.length & 255; m[3] = payload.length >> 8;
+  m.set(payload, 4);
+  tun.out.push(m);
+  tunWrite();
+}
+// One write at a time, each carrying up to TUN_WRITE bytes of the stream (messages may span writes).
+async function tunWrite() {
+  if (tun.writing || !tun.chr) return;
+  tun.writing = true;
+  const chr = tun.chr;
+  try {
+    while (tun.out.length && tun.chr === chr) {
+      const parts = [];
+      let size = 0;
+      while (tun.out.length && size < TUN_WRITE) {
+        const m = tun.out[0], take = Math.min(m.length, TUN_WRITE - size);
+        parts.push(m.subarray(0, take));
+        size += take;
+        if (take === m.length) tun.out.shift(); else tun.out[0] = m.subarray(take);
+      }
+      await (chr.writeValueWithResponse ? chr.writeValueWithResponse(join(parts)) : chr.writeValue(join(parts)));
+    }
+  } catch (e) {
+    // the link is going away; if it isn't, the bridge sees a broken stream and reconnects the phone
+  } finally {
+    tun.writing = false;
+    if (tun.out.length && tun.chr && tun.chr !== chr) tunWrite();  // a new link came up meanwhile
+  }
+}
+const RESET_ECHO = [TM.RESET, 0, 0, 0];
+function tunReceive(event) {
+  const v = event.target.value;
+  const b = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+  let rx = tun.rx.length ? join([tun.rx, b]) : b.slice();
+  if (tun.state === "syncing") {  // everything before the bridge's echo of our reset is stale
+    const at = find(rx, RESET_ECHO);
+    if (at < 0) {
+      tun.rx = rx.slice(Math.max(0, rx.length - 3));
+      return;
+    }
+    rx = rx.slice(at + 4);
+    tun.state = "ready";
+    wledStatus();
+    tunKick();
+  }
+  let o = 0;
+  while (rx.length - o >= 4 && tun.state === "ready") {
+    const type = rx[o], slot = rx[o + 1], len = rx[o + 2] | rx[o + 3] << 8;
+    if (type < TM.OPENED || type > TM.ACK || slot >= TUN_SLOTS || len > 1100) return tunResync();  // out of step
+    if (rx.length - o < 4 + len) break;
+    tunMessage(type, slot, rx.subarray(o + 4, o + 4 + len));
+    o += 4 + len;
+  }
+  tun.rx = rx.slice(o);
+}
+function tunMessage(type, slot, p) {
+  const job = tun.slots[slot];
+  if (!job) return;
+  job.seen = Date.now();
+  if (type === TM.OPENED) {
+    if (p[0]) {  // not opened: the slot is free again at once
+      tun.slots[slot] = null;
+      jobFail(job, new Error(OPEN_ERRORS[p[0]] || "Couldn't reach the light."));
+      tunKick();
+    }
+  } else if (type === TM.ACK) {
+    job.acked += p[0] | p[1] << 8;
+    jobPush(job);
+  } else if (type === TM.RDATA) {
+    jobData(job, p);
+  } else if (type === TM.CLOSED) {
+    tun.slots[slot] = null;
+    if (job.head && job.head.length == null && !job.head.chunked) jobDone(job, true);  // ends with the connection
+    else jobFail(job, new Error("the light closed the connection"));
+    tunKick();
+  }
+}
+
+// An HTTP request to WLED: resolves to {status, statusText, headers (lower case), body (bytes, unzipped)}.
+function wledFetch(method, path, {headers = {}, body = null, progress = null} = {}) {
+  if (tun.state === "missing") return Promise.reject(tunMissingError());
+  return new Promise((resolve, reject) => {
+    const head = [`${method} ${path} HTTP/1.1`, "Host: 127.0.0.1", "Connection: close"];
+    for (const [k, v] of Object.entries(headers)) if (!/^(host|connection|content-length)$/i.test(k)) head.push(`${k}: ${v}`);
+    if (body || method === "POST") head.push(`Content-Length: ${body ? body.length : 0}`);
+    const hb = enc.encode(head.join("\r\n") + "\r\n\r\n");
+    tun.queue.push({method, req: body ? join([hb, body]) : hb, sent: 0, acked: 0, parts: [], got: 0, head: null,
+                    done: false, resolve, reject, progress, queued: Date.now(), seen: Date.now()});
+    tun.used = Date.now();
+    tunKick();
+  });
+}
+function tunKick() {
+  if (tun.state === "ready") {
+    while (tun.queue.length) {
+      // take turns: a slot that just finished may still be closing
+      const slot = [tun.next % TUN_SLOTS, (tun.next + 1) % TUN_SLOTS].find((s) => !tun.slots[s]);
+      if (slot === undefined) break;
+      const job = tun.queue.shift();
+      tun.slots[slot] = job;
+      job.slot = slot;
+      job.seen = Date.now();
+      tun.next = slot + 1;
+      tunSend(TM.OPEN, slot, new Uint8Array([0, 80]));
+      jobPush(job);
+    }
+  }
+  wledBusy();
+  tunWatch();
+}
+function jobPush(job) {  // the request, as far as the window allows
+  while (job.sent < job.req.length && job.sent - job.acked < TUN_WINDOW) {
+    const n = Math.min(job.req.length - job.sent, 512, TUN_WINDOW - (job.sent - job.acked));
+    tunSend(TM.DATA, job.slot, job.req.subarray(job.sent, job.sent + n));
+    job.sent += n;
+  }
+}
+function jobData(job, p) {
+  if (job.done) return;
+  job.parts.push(p.slice());
+  job.got += p.length;
+  if (!job.head) {
+    const all = join(job.parts), end = find(all, [13, 10, 13, 10]);
+    if (end < 0) {
+      if (all.length > 32768) jobFail(job, new Error("the light's answer made no sense"));
+      return;
+    }
+    const lines = dec.decode(all.subarray(0, end)).split("\r\n");
+    const m = /^HTTP\/[\d.]+\s+(\d+)\s*(.*)$/.exec(lines[0]) || [];
+    const headers = {};
+    for (const l of lines.slice(1)) {
+      const i = l.indexOf(":");
+      if (i > 0) headers[l.slice(0, i).trim().toLowerCase()] = l.slice(i + 1).trim();
+    }
+    const status = +m[1] || 502;
+    job.head = {status, statusText: m[2] || "", headers,
+                length: headers["content-length"] != null ? +headers["content-length"] : null,
+                chunked: /chunked/i.test(headers["transfer-encoding"] || ""),
+                empty: job.method === "HEAD" || status === 204 || status === 304 || status < 200};
+    job.parts = [all.slice(end + 4)];
+    job.got = all.length - end - 4;
+  }
+  const h = job.head;
+  if (job.progress) job.progress(job.got, h.length);
+  if (h.empty || (h.length != null && job.got >= h.length)) return jobDone(job);
+  if (h.chunked && dechunk(join(job.parts))) return jobDone(job);
+}
+function dechunk(buf) {  // the body of a chunked answer, or null while it isn't complete
+  const out = [];
+  for (let o = 0; ;) {
+    const e = find(buf, [13, 10], o);
+    if (e < 0) return null;
+    const size = parseInt(dec.decode(buf.subarray(o, e)), 16);
+    if (!(size >= 0)) throw new Error("the light's answer made no sense");
+    if (size === 0) return join(out);
+    if (buf.length < e + 2 + size + 2) return null;
+    out.push(buf.subarray(e + 2, e + 2 + size));
+    o = e + 4 + size;
+  }
+}
+async function jobDone(job, closed = false) {
+  if (job.done) return;
+  job.done = true;
+  job.seen = Date.now();
+  tun.used = Date.now();
+  if (!closed) tunSend(TM.CLOSE, job.slot);  // WLED leaves its end open after answering: the phone closes it
+  wledBusy();
+  try {
+    const h = job.head;
+    let body = h.empty ? new Uint8Array(0) : h.chunked ? dechunk(join(job.parts)) : join(job.parts);
+    if (h.length != null) body = body.subarray(0, h.length);
+    if (/gzip/i.test(h.headers["content-encoding"] || "")) {
+      if (typeof DecompressionStream === "undefined") throw new Error("This needs iOS 16.4 or newer.");
+      const stream = new Blob([body]).stream().pipeThrough(new DecompressionStream("gzip"));
+      body = new Uint8Array(await new Response(stream).arrayBuffer());
+    }
+    job.resolve({status: h.status, statusText: h.statusText, headers: h.headers, body});
+  } catch (e) {
+    job.reject(e);
+  }
+}
+function jobFail(job, err) {
+  if (job.done) return;
+  job.done = true;
+  job.reject(err);
+  wledBusy();
+}
+function tunFailQueue(err) {
+  for (const job of tun.queue.splice(0)) jobFail(job, err);
+}
+// Nothing may hang: answers that stop coming are given up on, and a slot whose close never comes back
+// starts the stream over.
+function tunWatch() {
+  if (tun.timer) return;
+  tun.timer = setInterval(() => {
+    const now = Date.now();
+    for (let s = 0; s < TUN_SLOTS; s++) {
+      const job = tun.slots[s];
+      if (!job) continue;
+      if (!job.done && now - job.seen > 12000) {
+        jobFail(job, new Error("The light didn't answer."));
+        return tunResync();  // (the stream may be out of step: start it over)
+      }
+      if (job.done && now - job.seen > 5000) return tunResync();
+    }
+    if (tun.state === "syncing" && tun.chr && now - tun.syncAt > 5000) return tunResync();
+    for (const job of tun.queue.filter((j) => now - j.queued > 20000)) {
+      tun.queue.splice(tun.queue.indexOf(job), 1);
+      jobFail(job, new Error(tun.chr ? "The light didn't answer." : "The phone isn't connected to the light."));
+    }
+    if (!tun.slots.some(Boolean) && !tun.queue.length && tun.state !== "syncing") {
+      clearInterval(tun.timer);
+      tun.timer = 0;
+    }
+  }, 1000);
+}
+
+// ---- WLED's files: kept on the phone (they only change with its firmware), and checked once per visit
+let fileCache = null;
+const checked = new Set();
+function files() {
+  if (!fileCache) {
+    try { fileCache = JSON.parse(localStorage.getItem("wl-wled-files")) || {}; } catch (e) { fileCache = {}; }
+  }
+  return fileCache;
+}
+function keepFile(path, r) {
+  const type = r.headers["content-type"] || "";
+  if (r.status !== 200 || !r.headers.etag || !/html|javascript|css/i.test(type)) return;
+  const c = files();
+  c[path] = {etag: r.headers.etag, type, text: dec.decode(r.body), at: Date.now()};
+  for (;;) {
+    try { localStorage.setItem("wl-wled-files", JSON.stringify(c)); return; } catch (e) {
+      const old = Object.keys(c).filter((k) => k !== path).sort((a, b) => c[a].at - c[b].at)[0];  // full: drop the oldest
+      if (!old) return;
+      delete c[old];
+    }
+  }
+}
+async function wledGet(path, progress) {
+  const c = files()[path];
+  if (!c) {
+    const r = await wledFetch("GET", path, {progress});
+    keepFile(path, r);
+    return r;
+  }
+  if (!checked.has(path)) {  // changed since (WLED was updated)? then the next visit gets the new one
+    checked.add(path);
+    wledFetch("GET", path, {headers: {"If-None-Match": c.etag}}).then((r) => {
+      if (r.status !== 200) return;
+      keepFile(path, r);
+      if (path === "/" && Date.now() - wledShownAt < 4000) wledReload();  // just opened: show the new one now
+    }, () => checked.delete(path));
+  }
+  return {status: 200, statusText: "OK", headers: {"content-type": c.type, etag: c.etag}, body: enc.encode(c.text)};
+}
+
+// ---- the frame: its pages, and what the code in them asks for (see framePrelude)
+const FRAME_URL = new URL("wled.html", document.baseURI).href;
+const FRAME_BASE = new URL(FRAME_URL).pathname;  // WLED's pages show under this: .../wled.html/settings
+const results = {};  // answers to forms, until the frame shows them
+let resultSeq = 0;
+const blobs = new Map();
+
+// The WLED path a URL in the frame stands for ("/json/si"), or null for anything else. Relative URLs are
+// resolved as they would be on WLED itself, from the page's own WLED path.
+function wledMap(u, here) {
+  u = String(u).trim();
+  if (/^[a-z][a-z0-9+.-]*:/i.test(u) || u.startsWith("//")) {
+    let x;
+    try { x = new URL(u, location.href); } catch (e) { return null; }
+    if (x.origin !== location.origin || (x.pathname !== FRAME_BASE && !x.pathname.startsWith(FRAME_BASE + "/"))) return null;
+    return (x.pathname.slice(FRAME_BASE.length) || "/") + x.search;
+  }
+  try {
+    const y = new URL(u || ".", "http://wled" + (here || "/"));
+    return y.pathname + y.search;
+  } catch (e) {
+    return null;
+  }
+}
+async function wledPage(href) {
+  const url = new URL(href);
+  const token = url.searchParams.get("__wlr");
+  url.searchParams.delete("__wlr");
+  const path = wledMap(url.href, "/") || "/";
+  let r = results[token];
+  if (r) delete results[token];
+  else r = await wledGet(path, path === "/" ? wledProgress : null);
+  const location_ = r.headers.location;
+  if (r.status >= 300 && r.status < 400 && location_) {
+    const to = wledMap(location_, path);
+    return `<!doctype html><script>location.replace(${JSON.stringify(to != null ? FRAME_BASE + to : location_)})<\/script>`;
+  }
+  const text = dec.decode(r.body);
+  if (!/html/i.test(r.headers["content-type"] || "")) {  // JSON and such: shown as they are
+    return `<!doctype html><meta name="color-scheme" content="dark"><pre style="white-space:pre-wrap;word-break:break-all;margin:12px;font:13px ui-monospace,monospace">${text.replace(/[&<>]/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;"}[c]))}</pre>`;
+  }
+  const doc = new DOMParser().parseFromString(text, "text/html");
+  const loads = [];
+  for (const el of doc.querySelectorAll("script[src], link[href]")) {
+    const attr = el.tagName === "SCRIPT" ? "src" : "href";
+    const p = wledMap(el.getAttribute(attr), path);
+    if (p == null || (el.tagName === "LINK" && !/stylesheet/i.test(el.rel))) continue;
+    loads.push(wledBlob(p).then((u) => el.setAttribute(attr, u), () => el.removeAttribute(attr)));
+  }
+  await Promise.all(loads);
+  const s = doc.createElement("script");
+  s.textContent = `(${framePrelude})(${JSON.stringify(path)});`;
+  doc.head.insertBefore(s, doc.head.firstChild);
+  setTimeout(wledShown, 0);
+  return "<!DOCTYPE html>\n" + doc.documentElement.outerHTML;
+}
+function wledBlob(path) {  // a WLED script or stylesheet, as a local URL the frame can load
+  if (blobs.has(path)) return blobs.get(path);
+  const made = wledGet(path).then((r) => {
+    if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
+    if (!r.headers.etag) blobs.delete(path);  // (settings values and such change: fetched each time)
+    return URL.createObjectURL(new Blob([r.body], {type: (r.headers["content-type"] || "text/plain").split(";")[0]}));
+  });
+  blobs.set(path, made);
+  made.catch(() => blobs.delete(path));
+  return made;
+}
+// WLED's page is told it has no WebSocket (info.ws = -1), so it uses plain requests, which come through here.
+async function wledRequest(method, path, headers, body) {
+  let r = await wledFetch(method, path, {headers, body});
+  if (r.status === 200 && /^\/json(\/si|\/info)?(\?|$)/.test(path)) {
+    try {
+      const j = JSON.parse(dec.decode(r.body));
+      const info = path.startsWith("/json/info") ? j : j.info;
+      if (info && typeof info === "object") {
+        info.ws = -1;
+        r = Object.assign({}, r, {body: enc.encode(JSON.stringify(j))});
+      }
+    } catch (e) {}
+  }
+  return r;
+}
+// A form from WLED's settings: sent over Bluetooth, and its answer shown by opening the form's own address.
+async function wledSubmit(path, method, type, body) {
+  if (body.length > 200000 || /^\/update/.test(path)) throw new Error("That's too big to send over Bluetooth. Do it from the PC: WLED Link, WLED.");
+  const r = await wledFetch(method, path, {headers: {"Content-Type": type}, body});
+  if (r.status >= 300 && r.status < 400 && r.headers.location) {
+    const to = wledMap(r.headers.location, path);
+    return to != null ? FRAME_BASE + to : r.headers.location;
+  }
+  const token = String(++resultSeq);
+  results[token] = r;
+  const u = new URL(location.origin + FRAME_BASE + path);
+  u.searchParams.set("__wlr", token);
+  return u.pathname + u.search;
+}
+window.WLED_FRAME = {base: FRAME_BASE, map: wledMap, load: wledPage, request: wledRequest, blob: wledBlob,
+                     submit: wledSubmit, failed: (e) => wledCover("Couldn't open WLED", (e && e.message) || String(e), true)};
+
+// Runs first in each of WLED's pages in the frame (serialized into it; `here` is the page's WLED path). Sends
+// what the page asks of WLED to the phone page, which passes it on over Bluetooth.
+function framePrelude(here) {
+  "use strict";
+  var H = null, w = window;
+  try { while (!H && w.parent !== w) { w = w.parent; H = w.WLED_FRAME || null; } } catch (e) {}
+  if (!H) return;
+  var map = function (u) { return H.map(u, here); };
+  var bytes = function (body, headers) {  // any request body, as bytes, with its type if it brings one
+    if (body == null) return Promise.resolve(null);
+    var r = new Response(body);
+    if (!headers["content-type"] && r.headers.get("content-type")) headers["content-type"] = r.headers.get("content-type");
+    return r.arrayBuffer().then(function (b) { return new Uint8Array(b); });
+  };
+
+  var realFetch = window.fetch;
+  window.fetch = function (input, init) {
+    var url = typeof input === "string" ? input : input && input.url != null ? input.url : String(input);
+    var path = map(url);
+    if (path == null) return realFetch.apply(this, arguments);
+    init = init || {};
+    var method = String(init.method || (input && input.method) || "GET").toUpperCase(), headers = {};
+    try { new Headers(init.headers || (input && input.headers) || {}).forEach(function (v, k) { headers[k] = v; }); } catch (e) {}
+    return bytes(init.body, headers).then(function (b) { return H.request(method, path, headers, b); }).then(function (r) {
+      var empty = r.status === 204 || r.status === 304 || method === "HEAD";
+      return new Response(empty ? null : r.body, {status: r.status, statusText: r.statusText || "", headers: r.headers});
+    }, function (e) { throw new TypeError("Load failed: " + (e && e.message || e)); });
+  };
+
+  var RealXHR = window.XMLHttpRequest;
+  window.XMLHttpRequest = function () {
+    var x = new RealXHR(), job = null, open = x.open, send = x.send, setHeader = x.setRequestHeader;
+    x.open = function (m, u) {
+      var path = map(u);
+      if (path == null) return open.apply(x, arguments);
+      job = {method: String(m).toUpperCase(), path: path, headers: {}};
+    };
+    x.setRequestHeader = function (k, v) {
+      if (!job) return setHeader.apply(x, arguments);
+      job.headers[String(k).toLowerCase()] = v;
+    };
+    x.send = function (body) {
+      if (!job) return send.apply(x, arguments);
+      var set = function (k, v) { Object.defineProperty(x, k, {value: v, configurable: true}); };
+      var fire = function (t) { x.dispatchEvent(new Event(t)); };
+      bytes(body, job.headers).then(function (b) { return H.request(job.method, job.path, job.headers, b); }).then(function (r) {
+        var text = new TextDecoder().decode(r.body);
+        set("status", r.status); set("statusText", r.statusText || ""); set("responseText", text); set("response", text); set("readyState", 4);
+        fire("readystatechange"); fire("load"); fire("loadend");
+      }, function () {
+        set("status", 0); set("readyState", 4);
+        fire("readystatechange"); fire("error"); fire("loadend");
+      });
+    };
+    return x;
+  };
+
+  var RealWS = window.WebSocket;
+  var FakeWS = function (u, p) {  // WLED's page is told there is no WebSocket; this is for anything that tries anyway
+    if (map(String(u).replace(/^ws/i, "http")) == null) return p === undefined ? new RealWS(u) : new RealWS(u, p);
+    var s = new EventTarget();
+    s.url = String(u); s.readyState = 3; s.binaryType = "blob"; s.bufferedAmount = 0; s.protocol = ""; s.extensions = "";
+    s.send = function () {}; s.close = function () {};
+    setTimeout(function () {
+      var e = new Event("error"), c = new Event("close");
+      if (s.onerror) s.onerror(e);
+      s.dispatchEvent(e);
+      if (s.onclose) s.onclose(c);
+      s.dispatchEvent(c);
+    }, 0);
+    return s;
+  };
+  FakeWS.CONNECTING = 0; FakeWS.OPEN = 1; FakeWS.CLOSING = 2; FakeWS.CLOSED = 3;
+  window.WebSocket = FakeWS;
+
+  // scripts and stylesheets added later (WLED loads iro.js, and its settings pages their files, this way)
+  var hook = function (proto, prop) {
+    var d = Object.getOwnPropertyDescriptor(proto, prop);
+    Object.defineProperty(proto, prop, {configurable: true, enumerable: d.enumerable, get: d.get, set: function (v) {
+      var el = this, path = map(v);
+      if (path == null) return d.set.call(el, v);
+      H.blob(path).then(function (u) { d.set.call(el, u); }, function () { el.dispatchEvent(new Event("error")); });
+    }});
+  };
+  hook(HTMLScriptElement.prototype, "src");
+  hook(HTMLLinkElement.prototype, "href");
+  var setAttr = Element.prototype.setAttribute;
+  Element.prototype.setAttribute = function (n, v) {
+    var k = String(n).toLowerCase();
+    if ((k === "src" && this instanceof HTMLScriptElement) || (k === "href" && this instanceof HTMLLinkElement)) { this[k] = v; return; }
+    return setAttr.apply(this, arguments);
+  };
+
+  // forms (WLED's settings): sent over Bluetooth, and the answer shown in their place
+  var realSubmit = HTMLFormElement.prototype.submit;
+  var submit = function (form, submitter) {
+    var path = map(form.action || location.href);
+    if (path == null) return realSubmit.call(form);
+    var data;
+    try { data = new FormData(form, submitter); } catch (e) {
+      data = new FormData(form);
+      if (submitter && submitter.name) data.append(submitter.name, submitter.value);
+    }
+    if (String(form.method).toLowerCase() !== "post") {
+      var q = new URLSearchParams(data).toString();
+      location.href = H.base + path.split("?")[0] + (q ? "?" + q : "");
+      return;
+    }
+    var r = new Response(/multipart/i.test(form.enctype) ? data : new URLSearchParams(data));
+    var type = r.headers.get("content-type") || "application/x-www-form-urlencoded";
+    r.arrayBuffer().then(function (b) { return H.submit(path, "POST", type, new Uint8Array(b)); })
+      .then(function (u) { location.href = u; }, function (e) { alert(e && e.message ? e.message : "That didn't work."); });
+  };
+  HTMLFormElement.prototype.submit = function () { submit(this); };
+  window.addEventListener("submit", function (e) {
+    if (e.defaultPrevented) return;
+    e.preventDefault();
+    submit(e.target, e.submitter);
+  });
+}
+
+// ---- the sheet
+let wledLoaded = false, wledShownAt = 0, wledRefreshAt = 0, wledFailed = false;
+const frame = $("wledFrame");
+function wledCover(title, text = "", failed = false) {
+  $("wledCover").hidden = false;
+  $("wledCover").classList.toggle("failed", failed);
+  $("wledCoverTitle").textContent = title;
+  $("wledCoverText").textContent = text;
+  $("wledRetry").hidden = !failed;
+  wledFailed = failed;
+}
+function wledStatus() {  // the cover, while WLED's page hasn't shown yet
+  if ($("wledSheet").hidden || $("wledCover").hidden || wledFailed) return;
+  if (tun.state === "missing") wledCover("Can't open WLED yet", tunMissingError().message, true);
+  else if (tun.state !== "ready") wledCover("Connecting to the light…");
+}
+function wledProgress(got, total) {
+  if (!$("wledCover").hidden && !wledFailed) {
+    wledCover("Loading WLED…", total ? `${Math.round(got / 1024)} of ${Math.round(total / 1024)} KB` : `${Math.round(got / 1024)} KB`);
+  }
+}
+function wledShown() {
+  $("wledCover").hidden = true;
+  wledShownAt = Date.now();
+}
+function wledBusy() {
+  $("wledSheet").classList.toggle("working", tun.slots.some((j) => j && !j.done) || tun.queue.length > 0);
+}
+function wledReload() {
+  wledCover("Loading WLED…");
+  wledStatus();
+  const w = frame.contentWindow;
+  if (w && wledLoaded) w.location.replace(FRAME_URL);
+  else frame.src = FRAME_URL;
+  wledLoaded = true;
+}
+function wledNoteChange() {  // the light changed (from the PC, say): WLED's page catches up
+  if ($("wledSheet").hidden) return;
+  const now = Date.now();
+  if (now - tun.used < 1500 || now - wledRefreshAt < 2500) return;  // its own doing, or it just caught up
+  wledRefreshAt = now;
+  try {
+    const w = frame.contentWindow;
+    if (w && typeof w.requestJson === "function") w.requestJson();
+  } catch (e) {}
+}
+$("wledOpen").addEventListener("click", () => {
+  $("wledSheet").hidden = false;
+  document.body.classList.add("sheet-open");
+  if (!wledLoaded || wledFailed) wledReload();
+  else wledNoteChange();
+});
+$("wledBack").addEventListener("click", () => {
+  $("wledSheet").hidden = true;
+  document.body.classList.remove("sheet-open");
+});
+$("wledReload").addEventListener("click", wledReload);
+$("wledRetry").addEventListener("click", () => {
+  if (tun.state === "missing" && device && device.gatt.connected) {  // look at the bridge's layout again
+    tun.state = "off";
+    device.gatt.disconnect();
+  }
+  wledReload();
+});
 
 // Reconnect straight away to a light used before, where the browser allows it (no device picker).
 if (navigator.bluetooth && navigator.bluetooth.getDevices) {

@@ -3,7 +3,8 @@
 //
 // ESP-NOW mode: no Wi-Fi network at all. Everything the PC sends arrives over the encrypted ESP-NOW link
 // and is served right here: TCP connections go to WLED's own web server through the loopback interface
-// (127.0.0.1), so the full web UI, the JSON API and firmware updates work; UDP (SignalRGB's colours) goes
+// (127.0.0.1), so the full web UI, the JSON API and firmware updates work (for the phone page too, which
+// reaches the bridge over Bluetooth); UDP (SignalRGB's colours) goes
 // to WLED's UDP ports the same way; JSON commands from the control pages and the phone go straight to
 // WLED's state, and every change is pushed back to the bridge at once.
 // Wi-Fi mode: WLED joins the bridge's hidden network as before, and the radio link runs alongside.
@@ -27,14 +28,19 @@ namespace {
 // message types: the same numbers as the bridge's serial protocol (bridge/src/main.cpp)
 enum : uint8_t {
   H_WLED_CMD = 0x0B, H_TCP_OPEN = 0x10, H_TCP_DATA = 0x11, H_TCP_CLOSE = 0x12, H_UDP_SEND = 0x20,
-  L_RESET = 0x42,  // the PC's session with the bridge ended: close every connection
+  L_RESET = 0x42,  // [mask(1)]: close these connections (bit per connection; none given: all of them)
   L_MODE = 0x43,   // mode(1) channel(1): the bridge is about to switch; follow it now
+  L_CREDIT = 0x44, // conn(1) bytes(2 LE): the phone took this much of a connection's data
   B_WLED_STATE = 0x88, B_TCP_OPEN_RESULT = 0x90, B_TCP_DATA = 0x91, B_TCP_CLOSED = 0x92, B_TCP_ACK = 0x93,
 };
 enum : uint8_t { OPEN_OK = 0, OPEN_BAD_SLOT = 1, OPEN_NO_SOCKET = 2, OPEN_REFUSED = 3, OPEN_TIMEOUT = 4 };
-enum : uint8_t { CLOSE_PEER = 0, CLOSE_ERROR = 1, CLOSE_HOST = 2, CLOSE_OVERFLOW = 3 };
+enum : uint8_t { CLOSE_PEER = 0, CLOSE_ERROR = 1, CLOSE_HOST = 2, CLOSE_OVERFLOW = 3, CLOSE_RESET = 4 };
 
-const int MAX_CONNS = 6;               // the bridge offers the PC as many
+const int MAX_CONNS = 8;               // 0-5 the PC's (the bridge offers it as many), 6-7 the phone's
+const int PHONE_BASE = 6;
+// The bridge passes the phone's data on over Bluetooth, which is slower than the radio link: it holds this
+// much per connection, and says (L_CREDIT) as the phone takes it.
+const size_t PHONE_WINDOW = 3072;
 const size_t CONN_WINDOW = 2048;       // the bridge tells the PC this window in ESP-NOW mode
 const size_t TCP_CHUNK = 1024;
 const size_t CONTROL_ROOM = 512;       // queue space kept free for acks and closes
@@ -62,6 +68,7 @@ struct Conn {
   uint32_t since = 0;
   uint8_t* pending = nullptr;  // only when WLED's side of the socket was full: most connections never need it
   size_t pendingLen = 0, ackOwed = 0;
+  size_t credit = SIZE_MAX;    // bytes it may still send (the phone's connections)
 };
 
 wll::Link wlink;
@@ -217,6 +224,19 @@ void closeAll() {
     if (conns[i].state != C_FREE) connFree(i);
 }
 
+// The bridge forgot these connections (their owner started over). For the phone's, the bridge waits for a
+// "closed (reset)" for each: whatever arrives for it before that is left over from the one that went.
+void resetConns(uint8_t mask) {
+  for (int i = 0; i < MAX_CONNS; i++) {
+    if (!(mask & (1 << i))) continue;
+    if (conns[i].state != C_FREE) connFree(i);
+    if (i >= PHONE_BASE) {
+      uint8_t p[2] = {(uint8_t)i, CLOSE_RESET};
+      sendCtl(B_TCP_CLOSED, p, 2);
+    }
+  }
+}
+
 bool wouldBlock() { return errno == EAGAIN || errno == EWOULDBLOCK; }
 
 void openResult(uint8_t cid, uint8_t status) {
@@ -248,6 +268,7 @@ void handleOpen(const uint8_t* p, size_t n) {
   c.state = r == 0 ? C_OPEN : C_CONNECTING;
   c.since = millis();
   c.pendingLen = c.ackOwed = 0;
+  c.credit = cid >= PHONE_BASE ? PHONE_WINDOW : SIZE_MAX;
   if (r == 0) openResult(cid, OPEN_OK);
 }
 
@@ -336,12 +357,14 @@ void pumpConns() {
       else if (millis() - c.since > CLOSE_TIMEOUT_MS) connClosed(i, CLOSE_ERROR);
       continue;
     }
-    // WLED -> PC, only while the link has room (that is the back pressure towards WLED's web server)
-    if (wlink.sendRoom() < TCP_CHUNK + 1 + 2 + CONTROL_ROOM) continue;
-    int k = lwip_recv(c.sock, sockBuf + 1, TCP_CHUNK, MSG_DONTWAIT);
+    // WLED -> PC, only while the link has room (that is the back pressure towards WLED's web server), and
+    // the phone only as much as the bridge can hold for it
+    if (wlink.sendRoom() < TCP_CHUNK + 1 + 2 + CONTROL_ROOM || !c.credit) continue;
+    int k = lwip_recv(c.sock, sockBuf + 1, c.credit < TCP_CHUNK ? c.credit : TCP_CHUNK, MSG_DONTWAIT);
     if (k > 0) {
       sockBuf[0] = (uint8_t)i;
       wlink.sendMsg2(B_TCP_DATA, sockBuf, k + 1);
+      if (c.credit != SIZE_MAX) c.credit -= k;
     } else if (k == 0) {
       connClosed(i, CLOSE_PEER);
     } else if (!wouldBlock()) {
@@ -425,8 +448,12 @@ bool linkDeliver(const uint8_t* m, size_t n, bool reliable) {
     case H_TCP_DATA: handleData(m + 1, n - 1); return true;
     case H_TCP_CLOSE: handleClose(m + 1, n - 1); return true;
     case H_UDP_SEND: handleUdp(m + 1, n - 1); return true;
-    case L_RESET: closeAll(); return true;
+    case L_RESET: n >= 2 ? resetConns(m[1]) : closeAll(); return true;
     case L_MODE: if (n >= 3) linkHello(m[1], m[2]); return true;
+    case L_CREDIT:
+      if (n >= 4 && m[1] < MAX_CONNS && conns[m[1]].state != C_FREE && conns[m[1]].credit != SIZE_MAX)
+        conns[m[1]].credit += m[2] | m[3] << 8;
+      return true;
     default: return true;
   }
 }
@@ -617,7 +644,7 @@ class WledLinkUsermod : public Usermod {
     char kf[9] = "";
     if (cfgHaveKey) wll::fingerprint(cfgKey, kf);
     JsonObject w = root.createNestedObject(F("wll"));
-    w[F("v")] = 1;
+    w[F("v")] = 2;  // 2: the phone's connections
     w[F("mode")] = cfgMode == wll::MODE_ESPNOW ? "espnow" : "wifi";
     w[F("run")] = runMode == wll::MODE_ESPNOW ? "espnow" : "wifi";
     w[F("link")] = wlink.up();

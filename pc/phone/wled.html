@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>WLED</title>
+<style>html, body { margin: 0; height: 100%; background: #111; }</style>
+</head>
+<body>
+<script>
+// WLED's own page, fetched over Bluetooth by the phone page this frame is in (index.html next to this file).
+// WLED's other pages (its settings) open at .../wled.html/<page>, which GitHub Pages answers with the site's
+// 404.html: the same few lines as these.
+(function () {
+  var w = window, host = null;
+  try { while (!host && w.parent !== w) { w = w.parent; host = w.WLED_FRAME || null; } } catch (e) {}
+  if (!host) { location.replace("./"); return; }
+  host.load(location.href).then(function (html) {
+    document.open();
+    document.write(html);
+    document.close();
+  }, function (e) { host.failed(e); });
+})();
+</script>
+</body>
+</html>

@@ -1,2 +1,5 @@
 pyserial>=3.5
-esptool>=4.7  # only for "wledlink.py flash-bridge"
+esptool>=4.7     # only for "wledlink.py flash-bridge"
+pywebview>=5.0   # the app window
+pystray>=0.19    # the tray icon
+Pillow>=10.0     # icons for the tray

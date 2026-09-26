@@ -4,11 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark light">
-<title>Lights</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23111'/%3E%3Crect x='12' y='27' width='40' height='10' rx='5' fill='%23ffb45a'/%3E%3C/svg%3E">
+<title>WLED Link</title>
+<link rel="icon" href="/__wledlink/icon.png">
 <style>
 :root {
-  --bg: #0a0a0c; --surface: #151518; --surface-2: #1e1e23; --surface-3: #2a2a31;
+  --bg: #0a0a0c; --sidebar: #0f0f12; --surface: #151518; --surface-2: #1e1e23; --surface-3: #2a2a31;
   --line: rgba(255,255,255,.07); --text: #f5f5f7; --muted: #8e8e96; --faint: #5c5c66;
   --accent: #0a84ff; --good: #30d158; --warn: #ff9f0a; --bad: #ff453a;
   --on: #ffb45a; --radius: 22px; --radius-sm: 14px;
@@ -19,47 +19,101 @@
   --ease: cubic-bezier(.2,.8,.2,1);
 }
 @media (prefers-color-scheme: light) {
-  :root { --bg: #f2f2f7; --surface: #ffffff; --surface-2: #f2f2f5; --surface-3: #e5e5ea;
+  :root { --bg: #f2f2f7; --sidebar: #e9e9ef; --surface: #ffffff; --surface-2: #f2f2f5; --surface-3: #e5e5ea;
     --line: rgba(0,0,0,.07); --text: #1d1d1f; --muted: #6e6e73; --faint: #aeaeb2;
     --accent: #007aff; --good: #34c759; --shadow: 0 1px 2px rgba(0,0,0,.04), 0 12px 32px -18px rgba(0,0,0,.18); }
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { height: 100%; }
 html { background: var(--bg); }
-body { margin: 0; min-height: 100vh; color: var(--text); font: 15px/1.45 var(--font); -webkit-font-smoothing: antialiased;
-  background: radial-gradient(1200px 520px at 30% -10%, rgba(var(--light), calc(.16 * var(--level))), transparent 70%), var(--bg);
-  transition: background .6s var(--ease); }
+body { margin: 0; color: var(--text); font: 15px/1.45 var(--font); -webkit-font-smoothing: antialiased; overflow: hidden; }
 button, input, select { font: inherit; color: inherit; }
 button { cursor: pointer; }
 a { color: var(--accent); text-decoration: none; }
 svg { width: 20px; height: 20px; flex: none; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
-.app { max-width: 1120px; margin: 0 auto; padding: max(20px, env(safe-area-inset-top)) 20px 48px; }
+.app-mode { user-select: none; }
+/* slim scrollbars in the theme's colours, instead of Windows' grey ones */
+* { scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--text) 18%, transparent) transparent; }
+.app-mode input, .app-mode .selectable { user-select: text; }
 
-/* top bar */
-.topbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 22px; }
-.brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
-.logo { width: 40px; height: 40px; border-radius: 12px; display: grid; place-items: center; background: var(--surface); border: 1px solid var(--line); box-shadow: var(--shadow); }
-.logo i { width: 22px; height: 7px; border-radius: 4px; background: rgb(var(--light)); opacity: calc(.35 + .65 * var(--level)); box-shadow: 0 0 12px rgba(var(--light), calc(.9 * var(--level))); transition: all .4s var(--ease); }
-.title { font: 600 20px/1.1 var(--display); letter-spacing: -.01em; }
-.subtitle { color: var(--muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.top-actions { display: flex; align-items: center; gap: 10px; }
-.pill { display: inline-flex; align-items: center; gap: 8px; height: 32px; padding: 0 12px; border-radius: 999px; background: var(--surface); border: 1px solid var(--line); font-size: 13px; color: var(--muted); white-space: nowrap; }
-.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
-.pill.good .dot { background: var(--good); box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 22%, transparent); }
-.pill.warn .dot { background: var(--warn); } .pill.bad .dot { background: var(--bad); }
-.btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: 36px; padding: 0 14px; border-radius: 999px; border: 1px solid var(--line); background: var(--surface); color: var(--text); font-weight: 500; font-size: 14px; transition: transform .15s var(--ease), background .2s; }
-.btn:hover { background: var(--surface-2); } .btn:active { transform: scale(.97); }
+/* ---------- shell ---------- */
+.shell { display: grid; grid-template-columns: 232px minmax(0, 1fr); height: 100%; }
+.sidebar { display: flex; flex-direction: column; gap: 4px; padding: 18px 12px 14px; background: var(--sidebar); border-right: 1px solid var(--line); min-height: 0; }
+.brand { display: flex; align-items: center; gap: 11px; padding: 4px 8px 18px; min-width: 0; }
+.brand img { width: 38px; height: 38px; border-radius: 10px; flex: none; }
+.brand-name { font: 650 17px/1.15 var(--display); letter-spacing: -.01em; }
+.brand-sub { color: var(--muted); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.nav { display: flex; align-items: center; gap: 12px; height: 40px; padding: 0 12px; border: none; border-radius: 10px; background: none; color: var(--muted); font-weight: 500; text-align: left; transition: background .15s, color .15s; }
+.nav:hover { background: var(--surface); color: var(--text); }
+.nav.on { background: var(--surface-2); color: var(--text); }
+.nav.on svg { color: var(--accent); }
+.grow { flex: 1; }
+.status { display: flex; align-items: center; gap: 9px; height: 38px; padding: 0 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); color: var(--muted); font-size: 13px; text-align: left; }
+.status:hover { color: var(--text); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
+.good .dot { background: var(--good); box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 22%, transparent); }
+.warn .dot { background: var(--warn); } .bad .dot { background: var(--bad); }
+.content { position: relative; min-width: 0; min-height: 0; overflow: auto; background: radial-gradient(1100px 520px at 40% -12%, rgba(var(--light), calc(.14 * var(--level))), transparent 70%), var(--bg); transition: background .6s var(--ease); }
+.view { padding: 28px 32px 48px; }
+.view[hidden] { display: none; }
+.page { max-width: 760px; margin: 0 auto; }
+.view-title { margin: 4px 0 4px; font: 650 28px/1.15 var(--display); letter-spacing: -.02em; }
+.view-sub { margin: 0 0 22px; color: var(--muted); }
+
+/* narrow window: tabs at the bottom */
+@media (max-width: 720px) {
+  .shell { grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr) auto; }
+  .sidebar { order: 2; flex-direction: row; justify-content: space-around; gap: 0; padding: 6px 6px max(6px, env(safe-area-inset-bottom)); border-right: none; border-top: 1px solid var(--line); }
+  .brand, .grow, .status { display: none; }
+  .nav { flex-direction: column; gap: 3px; height: auto; padding: 6px 10px; font-size: 11px; background: none !important; }
+  .view { padding: 18px 16px 32px; }
+  .mobile-status { display: flex !important; }
+}
+.mobile-status { display: none; align-items: center; gap: 8px; margin: 0 0 14px; color: var(--muted); font-size: 13px; }
+
+/* ---------- common ---------- */
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: 36px; padding: 0 14px; border-radius: 999px; border: 1px solid var(--line); background: var(--surface-2); color: var(--text); font-weight: 500; font-size: 14px; transition: transform .15s var(--ease), background .2s; white-space: nowrap; }
+.btn:hover { background: var(--surface-3); } .btn:active { transform: scale(.97); }
 .btn.primary { background: var(--accent); border-color: transparent; color: #fff; }
 .btn.primary:hover { filter: brightness(1.08); }
+.btn.danger { color: var(--bad); }
 .btn svg { width: 16px; height: 16px; }
 .btn[disabled] { opacity: .45; pointer-events: none; }
+.section-title { display: flex; align-items: center; justify-content: space-between; margin: 24px 2px 10px; font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+code { font-family: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace; font-size: .92em; background: var(--surface-3); padding: 1px 6px; border-radius: 6px; }
 
-/* layout */
-.grid { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(300px, 1fr); gap: 20px; align-items: start; }
-@media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
-.card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
-.side { display: grid; gap: 20px; }
+/* lists (settings) */
+.list { padding: 4px 0; margin-bottom: 18px; overflow: hidden; }
+.list-head { display: flex; align-items: center; gap: 10px; padding: 14px 20px 6px; font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+.row { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 52px; padding: 10px 20px; border-top: 1px solid var(--line); }
+.list-head + .row { border-top: none; }
+.row .k { min-width: 0; } .row .k small { display: block; color: var(--muted); font-size: 12.5px; margin-top: 1px; }
+.row .v { color: var(--muted); text-align: right; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.mono { font-family: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace; font-size: 14px; }
+.copy { border: none; background: none; color: var(--accent); padding: 4px; margin-left: 4px; border-radius: 8px; vertical-align: middle; }
+.copy svg { width: 15px; height: 15px; }
+.row-actions { display: flex; gap: 10px; padding: 12px 20px 16px; flex-wrap: wrap; }
+.hint { color: var(--muted); font-size: 13px; padding: 0 20px 14px; }
+.switch { position: relative; width: 51px; height: 31px; flex: none; }
+.switch input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
+.switch span { position: absolute; inset: 0; border-radius: 999px; background: var(--surface-3); transition: background .2s; pointer-events: none; }
+.switch span::after { content: ""; position: absolute; top: 2px; left: 2px; width: 27px; height: 27px; border-radius: 50%; background: #fff; box-shadow: 0 2px 6px rgba(0,0,0,.25); transition: transform .25s var(--ease); }
+.switch input:checked + span { background: var(--good); }
+.switch input:checked + span::after { transform: translateX(20px); }
+.switch input:disabled + span { opacity: .45; }
+.switch input:focus-visible + span { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 55%, transparent); }
+select.select { height: 34px; border-radius: 10px; border: 1px solid var(--line); background: var(--surface-2); padding: 0 10px; max-width: 60%; }
+details > summary { list-style: none; cursor: pointer; }
+details > summary::-webkit-details-marker { display: none; }
+.chev { margin-left: auto; color: var(--faint); transition: transform .2s var(--ease); }
+details[open] > summary .chev { transform: rotate(90deg); }
+.sub-head { padding: 16px 20px 4px; font-weight: 600; font-size: 14px; }
+.form { display: grid; gap: 12px; padding: 4px 20px 18px; }
+.form label { display: grid; gap: 6px; font-size: 13px; color: var(--muted); }
+.form input, .form select { height: 40px; border-radius: 12px; border: 1px solid var(--line); background: var(--surface-2); padding: 0 12px; }
 
-/* hero */
+/* ---------- home ---------- */
 .hero { padding: 22px; overflow: hidden; position: relative; }
 .strip { position: relative; height: 92px; border-radius: 18px; background: var(--surface-2); overflow: hidden; margin-bottom: 22px; }
 .strip .bar { position: absolute; left: 22px; right: 22px; top: 40px; height: 12px; border-radius: 6px; background: var(--surface-3); transition: background .35s var(--ease), box-shadow .35s var(--ease), opacity .35s var(--ease); }
@@ -77,8 +131,7 @@ h1 { margin: 2px 0 0; font: 650 30px/1.1 var(--display); letter-spacing: -.02em;
 .power svg { width: 26px; height: 26px; stroke-width: 2.2; }
 .power.on { background: var(--on); color: #2b1a00; border-color: transparent; box-shadow: 0 8px 28px -8px rgba(255,180,90,.7); }
 .power:active { transform: scale(.94); }
-
-/* slider */
+.power[disabled] { opacity: .45; pointer-events: none; }
 .slider { position: relative; height: 60px; border-radius: 18px; background: var(--surface-2); overflow: hidden; touch-action: none; user-select: none; cursor: grab; outline: none; }
 .slider:active { cursor: grabbing; }
 .slider:focus-visible { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 55%, transparent); }
@@ -91,14 +144,12 @@ h1 { margin: 2px 0 0; font: 650 30px/1.1 var(--display); letter-spacing: -.02em;
 .slider .label svg { width: 22px; height: 22px; }
 .slider .label .pct { margin-left: auto; font-variant-numeric: tabular-nums; }
 .slider.disabled { opacity: .45; pointer-events: none; }
-
-/* tiles and chips */
-.section-title { display: flex; align-items: center; justify-content: space-between; margin: 24px 2px 10px; font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
 .tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
 @media (max-width: 560px) { .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .tile { position: relative; display: flex; flex-direction: column; align-items: flex-start; gap: 10px; padding: 16px; min-height: 112px; border-radius: 18px; border: 1px solid var(--line); background: var(--surface-2); text-align: left; transition: transform .15s var(--ease), background .2s, border-color .2s, box-shadow .2s; }
 .tile:hover { background: var(--surface-3); }
 .tile:active { transform: scale(.97); }
+.tile[disabled] { opacity: .5; pointer-events: none; }
 .tile.active { border-color: color-mix(in srgb, var(--accent) 70%, transparent); box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 70%, transparent) inset; background: color-mix(in srgb, var(--accent) 10%, var(--surface-2)); }
 .tile .check { position: absolute; top: 12px; right: 12px; width: 22px; height: 22px; border-radius: 50%; background: var(--accent); color: #fff; display: grid; place-items: center; transform: scale(0); transition: transform .2s var(--ease); }
 .tile .check svg { width: 13px; height: 13px; stroke-width: 3; }
@@ -114,35 +165,6 @@ h1 { margin: 2px 0 0; font: 650 30px/1.1 var(--display); letter-spacing: -.02em;
 .chip:hover { background: var(--surface-3); } .chip:active { transform: scale(.96); }
 .chip.active { background: var(--accent); border-color: transparent; color: #fff; }
 
-/* lists */
-.list { padding: 6px 0; }
-.list-head { display: flex; align-items: center; gap: 10px; padding: 14px 20px 8px; font: 600 16px/1.2 var(--display); }
-.list-head .ico { width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; color: #fff; }
-.list-head .ico svg { width: 17px; height: 17px; }
-.row { display: flex; align-items: center; justify-content: space-between; gap: 14px; min-height: 48px; padding: 8px 20px; border-top: 1px solid var(--line); }
-.list-head + .row { border-top: none; }
-.row .k { color: var(--muted); } .row .v { text-align: right; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
-.row .v.mono { font-family: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace; font-size: 14px; }
-.copy { border: none; background: none; color: var(--accent); padding: 4px; margin-left: 4px; border-radius: 8px; vertical-align: middle; }
-.copy svg { width: 15px; height: 15px; }
-.row-actions { display: flex; gap: 10px; padding: 12px 20px 16px; flex-wrap: wrap; }
-.hint { color: var(--muted); font-size: 13px; padding: 0 20px 14px; }
-.switch { position: relative; width: 51px; height: 31px; flex: none; }
-.switch input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
-.switch span { position: absolute; inset: 0; border-radius: 999px; background: var(--surface-3); transition: background .2s; pointer-events: none; }
-.switch span::after { content: ""; position: absolute; top: 2px; left: 2px; width: 27px; height: 27px; border-radius: 50%; background: #fff; box-shadow: 0 2px 6px rgba(0,0,0,.25); transition: transform .25s var(--ease); }
-.switch input:checked + span { background: var(--good); }
-.switch input:checked + span::after { transform: translateX(20px); }
-.switch input:focus-visible + span { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 55%, transparent); }
-select.select { height: 34px; border-radius: 10px; border: 1px solid var(--line); background: var(--surface-2); padding: 0 10px; max-width: 58%; }
-details > summary { list-style: none; cursor: pointer; }
-details > summary::-webkit-details-marker { display: none; }
-details .chev { margin-left: auto; color: var(--faint); transition: transform .2s var(--ease); }
-details[open] .chev { transform: rotate(90deg); }
-.form { display: grid; gap: 12px; padding: 4px 20px 18px; }
-.form label { display: grid; gap: 6px; font-size: 13px; color: var(--muted); }
-.form input, .form select { height: 40px; border-radius: 12px; border: 1px solid var(--line); background: var(--surface-2); padding: 0 12px; }
-
 /* setup assistant */
 .setup { padding: 22px; margin-bottom: 20px; }
 .setup h2 { margin: 0 0 4px; font: 650 20px/1.2 var(--display); }
@@ -152,13 +174,33 @@ details[open] .chev { transform: rotate(90deg); }
 .step .n { width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center; font-size: 13px; font-weight: 700; background: var(--surface-3); color: var(--muted); flex: none; }
 .step.done .n { background: var(--good); color: #fff; } .step.now .n { background: var(--accent); color: #fff; }
 .step b { display: block; } .step span { color: var(--muted); font-size: 14px; }
-code { font-family: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace; font-size: .92em; background: var(--surface-3); padding: 1px 6px; border-radius: 6px; }
 
-/* toast */
-.toast { position: fixed; left: 50%; bottom: max(24px, env(safe-area-inset-bottom)); transform: translate(-50%, 20px); max-width: min(560px, calc(100vw - 32px)); padding: 12px 18px; border-radius: 16px; background: rgba(40,40,46,.92); color: #fff; backdrop-filter: blur(20px); box-shadow: 0 12px 40px rgba(0,0,0,.35); font-size: 14px; opacity: 0; pointer-events: none; transition: all .3s var(--ease); z-index: 10; }
+/* ---------- WLED ---------- */
+#view-wled { position: absolute; inset: 0; padding: 0; display: flex; flex-direction: column; }
+#view-wled[hidden] { display: none; }
+.frame-bar { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--sidebar); }
+.frame-bar .title { font-weight: 600; margin-right: auto; }
+#wledFrame { flex: 1; width: 100%; border: 0; background: #111; }
+.empty { display: grid; place-items: center; text-align: center; flex: 1; color: var(--muted); padding: 40px; }
+.empty b { display: block; color: var(--text); font-size: 17px; margin-bottom: 4px; }
+
+/* ---------- phone ---------- */
+.steps2 { margin: 0; padding: 6px 20px 8px 20px; list-style: none; counter-reset: s; display: grid; gap: 14px; }
+.steps2 li { display: grid; grid-template-columns: 28px 1fr; gap: 12px; align-items: start; counter-increment: s; }
+.steps2 li::before { content: counter(s); width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); font-weight: 700; font-size: 13px; }
+.steps2 b { display: block; } .steps2 span { color: var(--muted); font-size: 14px; }
+.pinbox { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 6px 20px 4px; padding: 16px 18px; border-radius: 16px; background: var(--surface-2); }
+.pin { font: 650 30px/1 ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace; letter-spacing: .16em; }
+
+/* toast and overlay */
+.toast { position: fixed; left: 50%; bottom: 24px; transform: translate(-50%, 20px); max-width: min(560px, calc(100vw - 32px)); padding: 12px 18px; border-radius: 16px; background: rgba(40,40,46,.94); color: #fff; backdrop-filter: blur(20px); box-shadow: 0 12px 40px rgba(0,0,0,.35); font-size: 14px; opacity: 0; pointer-events: none; transition: all .3s var(--ease); z-index: 20; }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
-.toast.bad { background: rgba(120,20,20,.92); }
-.skeleton { color: transparent !important; background: var(--surface-2); border-radius: 8px; }
+.toast.bad { background: rgba(120,20,20,.94); }
+.overlay { position: fixed; inset: 0; display: grid; place-items: center; background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(8px); z-index: 15; text-align: center; padding: 24px; }
+.overlay[hidden] { display: none; }
+.overlay img { width: 72px; height: 72px; border-radius: 18px; margin-bottom: 14px; }
+.overlay h2 { margin: 0 0 6px; font: 650 22px/1.2 var(--display); }
+.overlay p { margin: 0 0 18px; color: var(--muted); }
 @media (prefers-color-scheme: light) {
   /* the preview stays a small night-time scene, and near-white tones get more colour so they read on white */
   .strip { background: #1c1c1f; } .strip .bar { background: #2e2e34; }
@@ -170,130 +212,192 @@ code { font-family: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospac
 </head>
 <body>
 <svg style="display:none" aria-hidden="true">
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="M3.5 11L12 4l8.5 7"/><path d="M5.5 9.5V20h13V9.5"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 20v-6M4 10V4M12 20v-8M12 8V4M20 20v-4M20 12V4M2 14h4M10 8h4M18 16h4"/></symbol>
+  <symbol id="i-phone" viewBox="0 0 24 24"><rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18h2"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></symbol>
   <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 3v8"/><path d="M17.7 6.8a8 8 0 1 1-11.4 0"/></symbol>
   <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
   <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
-  <symbol id="i-bt" viewBox="0 0 24 24"><path d="M7 7l10 10-5 5V2l5 5L7 17"/></symbol>
-  <symbol id="i-wifi" viewBox="0 0 24 24"><path d="M2 8.8a15 15 0 0 1 20 0"/><path d="M5 12.5a10 10 0 0 1 14 0"/><path d="M8.5 16a5 5 0 0 1 7 0"/><path d="M12 19.5h.01"/></symbol>
-  <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></symbol>
-  <symbol id="i-pulse" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></symbol>
   <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></symbol>
   <symbol id="i-open" viewBox="0 0 24 24"><path d="M14 4h6v6"/><path d="M20 4l-9 9"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></symbol>
   <symbol id="i-chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></symbol>
 </svg>
 
-<div class="app">
-  <header class="topbar">
+<div class="shell">
+  <nav class="sidebar" aria-label="Sections">
     <div class="brand">
-      <div class="logo"><i></i></div>
-      <div style="min-width:0"><div class="title">Lights</div><div class="subtitle" id="deviceName">Looking for your light…</div></div>
+      <img src="/__wledlink/icon.png" alt="">
+      <div style="min-width:0"><div class="brand-name">WLED Link</div><div class="brand-sub" id="deviceName">Looking for your light…</div></div>
     </div>
-    <div class="top-actions">
-      <span class="pill" id="linkPill"><span class="dot"></span><span id="linkText">Connecting</span></span>
-      <a class="btn" href="/" id="openWled" title="WLED's full controls"><svg><use href="#i-open"/></svg>WLED</a>
-    </div>
-  </header>
+    <button class="nav on" data-view="home"><svg><use href="#i-home"/></svg><span>Home</span></button>
+    <button class="nav" data-view="wled"><svg><use href="#i-sliders"/></svg><span>WLED</span></button>
+    <button class="nav" data-view="phone"><svg><use href="#i-phone"/></svg><span>Phone</span></button>
+    <button class="nav" data-view="settings"><svg><use href="#i-gear"/></svg><span>Settings</span></button>
+    <div class="grow"></div>
+    <button class="status" id="statusChip" title="Connection details"><span class="dot"></span><span id="statusText">Starting…</span></button>
+  </nav>
 
-  <section class="card setup" id="setup" hidden>
-    <h2>Finish setting up</h2>
-    <p>A couple of things still need to happen before the light can be controlled from here.</p>
-    <div class="steps" id="steps"></div>
-  </section>
-
-  <main class="grid">
-    <section class="card hero" aria-label="Light">
-      <div class="strip" id="strip"><div class="halo"></div><div class="bar"></div></div>
-      <div class="hero-head">
-        <div style="min-width:0">
-          <div class="eyebrow" id="eyebrow">Light</div>
-          <h1 id="modeTitle">—</h1>
-          <div class="caption" id="modeCaption"></div>
-        </div>
-        <button class="power" id="power" aria-label="Turn the light on or off" aria-pressed="false"><svg><use href="#i-power"/></svg></button>
-      </div>
-      <div class="slider disabled" id="bri" role="slider" tabindex="0" aria-label="Brightness" aria-valuemin="1" aria-valuemax="100" aria-valuenow="0">
-        <div class="fill"></div>
-        <div class="label"><svg><use href="#i-sun"/></svg><span>Brightness</span><span class="pct" id="briText">—</span></div>
-        <div class="label ink" aria-hidden="true"><svg><use href="#i-sun"/></svg><span>Brightness</span><span class="pct" id="briInk">—</span></div>
-      </div>
-      <div class="section-title"><span>Modes</span></div>
-      <div class="tiles">
-        <button class="tile" data-mode="sync"><span class="check"><svg><use href="#i-check"/></svg></span><span class="swatch sync"></span><span class="tile-name">PC Sync</span><span class="tile-sub">Follows SignalRGB</span></button>
-        <button class="tile" data-mode="neutral"><span class="check"><svg><use href="#i-check"/></svg></span><span class="swatch neutral"></span><span class="tile-name">Neutral</span><span class="tile-sub">Both whites, full</span></button>
-        <button class="tile" data-mode="cool"><span class="check"><svg><use href="#i-check"/></svg></span><span class="swatch cool"></span><span class="tile-name">Cool</span><span class="tile-sub">6000 K, full</span></button>
-        <button class="tile" data-mode="warm"><span class="check"><svg><use href="#i-check"/></svg></span><span class="swatch warm"></span><span class="tile-name">Warm</span><span class="tile-sub">3000 K, full</span></button>
-      </div>
-      <div id="presetsWrap" hidden>
-        <div class="section-title"><span>Presets</span></div>
-        <div class="chips" id="presets"></div>
+  <main class="content" id="content">
+    <!-- Home: the light -->
+    <section class="view" id="view-home">
+      <div class="page">
+        <div class="mobile-status" id="mobileStatus"><span class="dot"></span><span id="mobileStatusText">Starting…</span></div>
+        <section class="card setup" id="setup" hidden>
+          <h2>Finish setting up</h2>
+          <p>A couple of things still need to happen before the light can be controlled from here.</p>
+          <div class="steps" id="steps"></div>
+        </section>
+        <section class="card hero" aria-label="Light">
+          <div class="strip" id="strip"><div class="halo"></div><div class="bar"></div></div>
+          <div class="hero-head">
+            <div style="min-width:0">
+              <div class="eyebrow" id="eyebrow">Light</div>
+              <h1 id="modeTitle">—</h1>
+              <div class="caption" id="modeCaption"></div>
+            </div>
+            <button class="power" id="power" aria-label="Turn the light on or off" aria-pressed="false"><svg><use href="#i-power"/></svg></button>
+          </div>
+          <div class="slider disabled" id="bri" role="slider" tabindex="0" aria-label="Brightness" aria-valuemin="1" aria-valuemax="100" aria-valuenow="0">
+            <div class="fill"></div>
+            <div class="label"><svg><use href="#i-sun"/></svg><span>Brightness</span><span class="pct" id="briText">—</span></div>
+            <div class="label ink" aria-hidden="true"><svg><use href="#i-sun"/></svg><span>Brightness</span><span class="pct" id="briInk">—</span></div>
+          </div>
+          <div class="section-title"><span>Modes</span></div>
+          <div class="tiles">
+            <button class="tile" data-mode="sync"><span class="check"><svg><use href="#i-check"/></svg></span><span class="swatch sync"></span><span class="tile-name">PC Sync</span><span class="tile-sub">Follows SignalRGB</span></button>
+            <button class="tile" data-mode="neutral"><span class="check"><svg><use href="#i-check"/></svg></span><span class="swatch neutral"></span><span class="tile-name">Neutral</span><span class="tile-sub">Both whites, full</span></button>
+            <button class="tile" data-mode="cool"><span class="check"><svg><use href="#i-check"/></svg></span><span class="swatch cool"></span><span class="tile-name">Cool</span><span class="tile-sub">6000 K, full</span></button>
+            <button class="tile" data-mode="warm"><span class="check"><svg><use href="#i-check"/></svg></span><span class="swatch warm"></span><span class="tile-name">Warm</span><span class="tile-sub">3000 K, full</span></button>
+          </div>
+          <div id="presetsWrap" hidden>
+            <div class="section-title"><span>Presets</span></div>
+            <div class="chips" id="presets"></div>
+          </div>
+        </section>
       </div>
     </section>
 
-    <aside class="side">
-      <section class="card list">
-        <div class="list-head"><span class="ico" style="background:#0a84ff"><svg><use href="#i-wifi"/></svg></span>Connection</div>
-        <div class="row"><span class="k">Bridge</span><span class="v" id="rBridge">—</span></div>
-        <div class="row"><span class="k">Light network</span><span class="v" id="rNet">—</span></div>
-        <div class="row"><span class="k">Signal</span><span class="v" id="rSignal">—</span></div>
-        <div class="row"><span class="k">SignalRGB address</span><span class="v mono" id="rAddr">—</span></div>
-      </section>
+    <!-- WLED: its own full controls -->
+    <section class="view" id="view-wled" hidden>
+      <div class="frame-bar">
+        <span class="title">WLED</span>
+        <button class="btn" id="wledReload" title="Reload"><svg><use href="#i-refresh"/></svg>Reload</button>
+        <button class="btn" id="wledBrowser" title="Open in your web browser"><svg><use href="#i-open"/></svg>Open in browser</button>
+      </div>
+      <div class="empty" id="wledEmpty" hidden><div><b>The light isn't connected</b>WLED's controls show up here as soon as it is.</div></div>
+      <iframe id="wledFrame" title="WLED" hidden></iframe>
+    </section>
 
-      <section class="card list" id="phoneCard" hidden>
-        <div class="list-head"><span class="ico" style="background:#5e5ce6"><svg><use href="#i-bt"/></svg></span>Phone</div>
-        <div class="row"><span class="k">Bluetooth name</span><span class="v">Lamp</span></div>
-        <div class="row"><span class="k">Pairing PIN</span><span class="v mono" id="rPin">—</span></div>
-        <div class="row"><span class="k">Paired phones</span><span class="v" id="rPhones">—</span></div>
-        <div class="row"><span class="k">Address</span><span class="v mono" id="rPhoneUrl">—</span></div>
-        <div class="row-actions">
-          <button class="btn primary" id="pairBtn">Pair a phone</button>
-          <button class="btn" id="forgetBtn">Forget phones</button>
+    <!-- Phone: Bluetooth control from an iPhone -->
+    <section class="view" id="view-phone" hidden>
+      <div class="page">
+        <h2 class="view-title">Phone</h2>
+        <p class="view-sub">Control the light from your iPhone over Bluetooth. The phone stays on its normal Wi-Fi.</p>
+        <div id="phoneOff" class="card list" hidden><div class="hint" style="padding:16px 20px">Phone control needs the bridge to be connected.</div></div>
+        <div id="phoneOn">
+          <section class="card list">
+            <div class="list-head">Set up an iPhone</div>
+            <ol class="steps2">
+              <li><div><b>Install Bluefy</b><span>A free web browser with Bluetooth, from the App Store. Safari can't use Bluetooth.</span></div></li>
+              <li><div><b>Open the phone page in Bluefy</b><span id="phoneUrlText">Type this address in Bluefy's address bar and save it as a favourite:</span>
+                <div class="mono selectable" id="phoneUrl" style="margin-top:6px">—</div></div></li>
+              <li><div><b>Pair</b><span>Press Pair a phone below, then in Bluefy tap Connect, choose Lamp and type the PIN when iOS asks.</span></div></li>
+            </ol>
+            <div class="pinbox"><div><div class="eyebrow">Pairing PIN</div><div class="pin selectable" id="rPin">------</div></div>
+              <button class="btn primary" id="pairBtn">Pair a phone</button></div>
+            <div class="hint" style="padding-top:10px">After pairing, the phone connects by itself whenever the page is open.</div>
+          </section>
+          <section class="card list">
+            <div class="row"><span class="k">Paired phones</span><span class="v" id="rPhones">—</span></div>
+            <div class="row"><span class="k">Bluetooth name</span><span class="v">Lamp</span></div>
+            <div class="row-actions"><button class="btn danger" id="forgetBtn">Forget all phones</button></div>
+          </section>
         </div>
-        <div class="hint">On your iPhone, open the phone page in the Bluefy app. Press Pair a phone here, then tap
-          Connect there, pick Lamp and type the PIN when iOS asks.</div>
-      </section>
+      </div>
+    </section>
 
-      <section class="card list">
-        <div class="list-head"><span class="ico" style="background:#8e8e93"><svg><use href="#i-gear"/></svg></span>Settings</div>
-        <div class="row"><span class="k">Connection to the light<br><small style="color:var(--faint)" id="linkHint">—</small></span>
-          <select class="select" id="linkMode">
-            <option value="espnow">ESP-NOW, no network</option>
-            <option value="wifi">Wi-Fi network</option>
-          </select></div>
-        <div class="row"><span class="k">Remember the look<br><small style="color:var(--faint)">Comes back the same after a power cut</small></span>
-          <label class="switch"><input type="checkbox" id="restore"><span></span></label></div>
-        <div class="row"><span class="k">Instant changes<br><small style="color:var(--faint)">No fade, also in WLED's own page</small></span>
-          <label class="switch"><input type="checkbox" id="instant"><span></span></label></div>
-        <div class="row"><span class="k">WLED backup hotspot</span>
-          <select class="select" id="hotspot">
-            <option value="boot">Only at startup</option>
-            <option value="fallback">When the bridge is gone</option>
-            <option value="off">Never</option>
-          </select></div>
-        <details>
-          <summary class="row"><span class="k">Bridge Wi-Fi</span><span class="v" id="rWifi">—</span><svg class="chev"><use href="#i-chev"/></svg></summary>
-          <form class="form" id="wifiForm">
-            <label>Network name<input name="ssid" maxlength="32" required autocomplete="off"></label>
-            <label>Password<input name="password" minlength="8" maxlength="63" required autocomplete="off"></label>
-            <label>Channel<select name="channel"><option value="0">Automatic</option><option>1</option><option>6</option><option>11</option></select></label>
-            <div><button class="btn primary" type="submit">Save and restart bridge</button></div>
-            <span class="hint" style="padding:0">Give WLED the new name and password first, or it will lose the connection.</span>
-          </form>
+    <!-- Settings -->
+    <section class="view" id="view-settings" hidden>
+      <div class="page">
+        <h2 class="view-title">Settings</h2>
+        <p class="view-sub" id="settingsSub">Everything is set up automatically. These are here if you want them.</p>
+
+        <section class="card list" id="generalCard">
+          <div class="list-head">General</div>
+          <div class="row"><span class="k">Start with Windows<small id="autostartHint">Runs in the background when you sign in</small></span>
+            <label class="switch"><input type="checkbox" id="autostart"><span></span></label></div>
+        </section>
+
+        <section class="card list">
+          <div class="list-head">Light</div>
+          <div class="row"><span class="k">Remember the look<small>Comes back the same after a power cut</small></span>
+            <label class="switch"><input type="checkbox" id="restore"><span></span></label></div>
+          <div class="row"><span class="k">Instant changes<small>No fade, also in WLED's own controls</small></span>
+            <label class="switch"><input type="checkbox" id="instant"><span></span></label></div>
+        </section>
+
+        <section class="card list">
+          <div class="list-head">SignalRGB</div>
+          <div class="row"><span class="k">Device address<small>In SignalRGB, add a WLED device with this address</small></span>
+            <span class="v mono" id="rAddr">—</span></div>
+        </section>
+
+        <section class="card list" id="connectionCard">
+          <div class="list-head">Connection</div>
+          <div class="row"><span class="k">Connection to the light<small id="linkHint">—</small></span>
+            <select class="select" id="linkMode"><option value="espnow">ESP-NOW (no network)</option><option value="wifi">Wi-Fi network</option></select></div>
+          <div class="row"><span class="k">Bridge</span><span class="v" id="rBridge">—</span></div>
+          <div class="row"><span class="k">Light</span><span class="v" id="rLight">—</span></div>
+        </section>
+
+        <details class="card list" id="advanced">
+          <summary class="list-head" style="padding-bottom:14px">Advanced<svg class="chev"><use href="#i-chev"/></svg></summary>
+          <div class="row"><span class="k">WLED backup hotspot<small>When WLED opens its own Wi-Fi hotspot</small></span>
+            <select class="select" id="hotspot"><option value="boot">Only at startup</option><option value="fallback">When the bridge is gone</option><option value="off">Never</option></select></div>
+          <details>
+            <summary class="row"><span class="k">Bridge Wi-Fi<small>For the Wi-Fi connection option</small></span><span class="v" id="rWifi">—</span><svg class="chev"><use href="#i-chev"/></svg></summary>
+            <form class="form" id="wifiForm">
+              <label>Network name<input name="ssid" maxlength="32" required autocomplete="off" class="selectable"></label>
+              <label>Password<input name="password" minlength="8" maxlength="63" required autocomplete="off" class="selectable"></label>
+              <label>Channel<select name="channel"><option value="0">Automatic</option><option>1</option><option>6</option><option>11</option></select></label>
+              <div><button class="btn primary" type="submit">Save and restart the bridge</button></div>
+              <span class="hint" style="padding:0">The light gets the new name and password too.</span>
+            </form>
+          </details>
+          <div class="row"><span class="k">Bridge<small>Starts the bridge over; the lights are back in a few seconds</small></span><button class="btn" id="rebootBtn">Restart</button></div>
+          <div class="row"><span class="k">Log files</span><button class="btn" id="logsBtn">Open folder</button></div>
+          <div class="sub-head">Diagnostics</div>
+          <div class="row"><span class="k">USB link</span><span class="v" id="dLink">—</span></div>
+          <div class="row"><span class="k">Bridge uptime</span><span class="v" id="dUp">—</span></div>
+          <div class="row"><span class="k">Bridge memory</span><span class="v" id="dMem">—</span></div>
+          <div class="row"><span class="k">Colour frames</span><span class="v" id="dUdp">—</span></div>
+          <div class="row"><span class="k">Link errors</span><span class="v" id="dErr">—</span></div>
+          <div class="row" id="dRadioRow" style="display:none"><span class="k">Radio link</span><span class="v" id="dRadio">—</span></div>
+          <div class="row"><span class="k">Bluetooth</span><span class="v" id="dBle">—</span></div>
         </details>
-      </section>
 
-      <details class="card list">
-        <summary class="list-head"><span class="ico" style="background:#30d158"><svg><use href="#i-pulse"/></svg></span>Diagnostics<svg class="chev"><use href="#i-chev"/></svg></summary>
-        <div class="row"><span class="k">Link</span><span class="v" id="dLink">—</span></div>
-        <div class="row"><span class="k">Firmware</span><span class="v" id="dFw">—</span></div>
-        <div class="row"><span class="k">Bridge uptime</span><span class="v" id="dUp">—</span></div>
-        <div class="row"><span class="k">Bridge memory</span><span class="v" id="dMem">—</span></div>
-        <div class="row"><span class="k">Colour frames</span><span class="v" id="dUdp">—</span></div>
-        <div class="row"><span class="k">Link errors</span><span class="v" id="dErr">—</span></div>
-        <div class="row" id="dRadioRow" style="display:none"><span class="k">Radio link</span><span class="v" id="dRadio">—</span></div>
-        <div class="row"><span class="k">WLED</span><span class="v" id="dWled">—</span></div>
-      </details>
-    </aside>
+        <section class="card list">
+          <div class="list-head">About</div>
+          <div class="row"><span class="k">WLED Link</span><span class="v" id="aApp">—</span></div>
+          <div class="row"><span class="k">Bridge firmware</span><span class="v" id="aBridge">—</span></div>
+          <div class="row"><span class="k">WLED</span><span class="v" id="aWled">—</span></div>
+          <div class="row"><span class="k">Source code</span><a class="v" href="https://github.com/ZPenguinMaster/wled-link" data-external>github.com/ZPenguinMaster/wled-link</a></div>
+          <div class="row-actions"><button class="btn danger" id="quitBtn"><svg><use href="#i-power"/></svg>Quit WLED Link</button></div>
+        </section>
+      </div>
+    </section>
   </main>
+</div>
+
+<div class="overlay" id="stopped" hidden>
+  <div>
+    <img src="/__wledlink/icon.png" alt="" onerror="this.style.display='none'">
+    <h2>WLED Link isn't running</h2>
+    <p id="stoppedText">It was quit, or it's starting up.</p>
+    <button class="btn primary" id="startBtn" hidden>Start WLED Link</button>
+  </div>
 </div>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
@@ -305,12 +409,14 @@ const $ = (id) => document.getElementById(id);
 const SYNC = {on: true, lor: 0, live: false, seg: {fx: 0, col: [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]}};
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
 const TONES = {warm: [255, 176, 96], neutral: [255, 242, 222], cool: [214, 229, 255]};
-let status = null;
+const inApp = new URLSearchParams(location.search).has("app");  // the WLED Link window, not a browser tab
+if (inApp) document.documentElement.classList.add("app-mode");
+let status = null, appInfo = null;
 let presets = [], presetsFor = null, presetsAt = 0;
 let pairUntil = 0;
 const hold = {};  // optimistic values: {field: {value, until}}
 
-// ---------- data from the link ----------
+// ---------- the light ----------
 function light() {
   const l = Object.assign({}, (status && status.light) || {});
   const now = Date.now();
@@ -333,32 +439,60 @@ function modeOf(l) {
   return "custom";
 }
 
+// ---------- navigation ----------
+const VIEWS = ["home", "wled", "phone", "settings"];
+function show(view) {
+  if (!VIEWS.includes(view)) view = "home";
+  for (const v of VIEWS) $("view-" + v).hidden = v !== view;
+  document.querySelectorAll(".nav").forEach((n) => n.classList.toggle("on", n.dataset.view === view));
+  if (location.hash.slice(1) !== view) history.replaceState(null, "", "#" + view);
+  if (view === "settings") loadAppInfo();
+  if (view === "wled") showWled();
+  $("content").scrollTop = 0;
+  render();
+}
+document.querySelectorAll(".nav").forEach((n) => n.addEventListener("click", () => show(n.dataset.view)));
+$("statusChip").addEventListener("click", () => { show("settings"); $("connectionCard").scrollIntoView({block: "center", behavior: "smooth"}); });
+window.addEventListener("hashchange", () => show(location.hash.slice(1)));
+document.addEventListener("keydown", (e) => {  // Ctrl+1..4
+  if ((e.ctrlKey || e.metaKey) && e.key >= "1" && e.key <= "4") { e.preventDefault(); show(VIEWS[+e.key - 1]); }
+});
+
+// WLED's own controls, inside the app (same address, so it just works)
+let wledLoaded = false;
+function showWled() {
+  const up = !!(status && status.wled);
+  $("wledEmpty").hidden = up;
+  $("wledFrame").hidden = !up;
+  if (up && !wledLoaded) { $("wledFrame").src = "/"; wledLoaded = true; }
+}
+$("wledReload").addEventListener("click", () => { wledLoaded = false; showWled(); });
+$("wledBrowser").addEventListener("click", () => openExternal(location.origin + "/"));
+
 // ---------- rendering ----------
 function render() {
-  const s = status, b = (s && s.bridge) || {}, w = s && s.wled, l = light();
+  const s = status, b = (s && s.bridge) || {}, w = s && s.wled, l = light(), lk = (s && s.link) || {};
   const ready = b.state === "ready", mode = modeOf(l);
   const on = mode !== "off" && mode !== "unknown";
   const pct = l.bri > 0 ? Math.max(1, Math.round(l.bri / 2.55)) : 0;
 
-  // header
+  // status, in the sidebar (and at the top in a narrow window)
+  const cls = w ? "good" : ready ? "warn" : "bad";
+  const text = !s ? "Starting…" : w ? "Connected" : ready ? "Light not connected" : b.state === "paused" ? "Paused" : "Bridge not found";
+  $("statusChip").className = "status " + cls; $("statusText").textContent = text;
+  $("mobileStatus").className = "mobile-status " + cls; $("mobileStatusText").textContent = text;
   $("deviceName").textContent = w ? `${w.name || "WLED"} · ${w.leds || "?"} LEDs` : ready ? "Waiting for the light…" : "Looking for the bridge…";
-  const pill = $("linkPill");
-  pill.className = "pill " + (w ? "good" : ready ? "warn" : "bad");
-  $("linkText").textContent = w ? "Connected" : ready ? "Light not connected" : b.state === "paused" ? "Paused" : "Bridge not found";
 
-  // light colour for the strip, background and tiles
+  // the light's colour, for the preview, the background and the slider
   let rgb = [70, 70, 80], rainbow = false;
   if (mode in TONES) rgb = TONES[mode];
   else if (mode === "sync" || mode === "effects" || mode === "preset") rainbow = true;
   else if (mode === "custom" && l.col) rgb = l.col[3] > 0 && !(l.col[0] || l.col[1] || l.col[2]) ? TONES.neutral : l.col.slice(0, 3);
-  const level = on ? Math.max(.25, (l.bri || 0) / 255) : 0;
   document.documentElement.style.setProperty("--light", rgb.join(","));
-  document.documentElement.style.setProperty("--level", level.toFixed(3));
-  const strip = $("strip");
-  strip.classList.toggle("lit", on);
-  strip.classList.toggle("rainbow", rainbow);
+  document.documentElement.style.setProperty("--level", (on ? Math.max(.25, (l.bri || 0) / 255) : 0).toFixed(3));
+  $("strip").classList.toggle("lit", on);
+  $("strip").classList.toggle("rainbow", rainbow);
 
-  // title
   const names = {off: "Off", sync: "PC Sync", effects: "WLED effect", neutral: "Neutral white", cool: "Cool white",
                  warm: "Warm white", custom: "Custom colour", unknown: "Not connected"};
   let title = names[mode], caption = "";
@@ -366,73 +500,66 @@ function render() {
   if (mode === "sync") caption = "Following SignalRGB";
   else if (mode === "effects") caption = "SignalRGB isn't sending right now";
   else if (mode === "off") caption = "Tap power or pick a mode";
-  else if (mode === "unknown") caption = !s ? "Starting…" : !ready ? "Plug in the bridge to continue" : "Waiting for WLED to join the bridge";
+  else if (mode === "unknown") caption = !s ? "Starting…" : !ready ? "Plug in the bridge to continue" : "Waiting for the light";
   if (on && mode !== "sync") caption = caption ? `${caption} · ${pct}%` : `${pct}% brightness`;
   $("eyebrow").textContent = w ? (w.name || "Light") : "Light";
   $("modeTitle").textContent = title;
   $("modeCaption").textContent = caption;
-
   const power = $("power");
   power.classList.toggle("on", on);
   power.setAttribute("aria-pressed", on);
   power.disabled = !w;
-
-  // brightness
   const slider = $("bri");
   slider.classList.toggle("disabled", !w);
   slider.classList.toggle("vivid", rainbow);
   if (!slider.classList.contains("dragging")) setSlider(on ? pct : 0, w ? (on ? pct + "%" : "Off") : "—");
-
-  // tiles and presets
   document.querySelectorAll(".tile").forEach((t) => { t.classList.toggle("active", t.dataset.mode === mode); t.disabled = !w; });
   document.querySelectorAll(".chip").forEach((c) => c.classList.toggle("active", mode === "preset" && +c.dataset.id === l.ps));
   if (w && (presetsFor !== w.ip || Date.now() - presetsAt > 60000)) loadPresets(w.ip);
 
-  // setup assistant
+  // setup assistant (only until everything works)
   const joined = s && s.stations && s.stations.length > 0;
-  const lk = (s && s.link) || {};
   const steps = [
     {done: ready, title: "Plug in the bridge", text: "Connect the bridge ESP32 to this PC with a USB data cable."},
     {done: ready && joined, title: "Connect the light to the bridge",
-     text: ready && lk.mode === "espnow" ? "The light and the bridge find each other over ESP-NOW. If this takes more than a minute, switch Connection to the light to Wi-Fi and set the light up there first."
-       : ready ? `In WLED's Wi-Fi settings, type the network <code>${esc(b.ssid)}</code> with password <code>${esc(b.password)}</code>${b.hidden ? " (it's hidden, so type the name)" : ""}.` : "WLED joins the bridge's own private Wi-Fi network."},
-    {done: !!w, title: "Wait for the light to answer", text: "This takes a few seconds after it joins."},
+     text: ready && lk.mode === "espnow" ? "The light and the bridge find each other by themselves. If this takes more than a minute, switch Connection to the light to Wi-Fi in Settings and set the light up there first."
+       : ready ? `In WLED's Wi-Fi settings, type the network <code>${esc(b.ssid)}</code> with password <code>${esc(b.password)}</code>${b.hidden ? " (it's hidden, so type the name)" : ""}.` : "It joins the bridge by itself once the bridge is plugged in."},
+    {done: !!w, title: "Wait for the light to answer", text: "This takes a few seconds after it connects."},
   ];
   const current = steps.findIndex((x) => !x.done);
   $("setup").hidden = !s || current === -1;
   $("steps").innerHTML = steps.map((x, i) => `<div class="step ${x.done ? "done" : i === current ? "now" : ""}"><span class="n">${x.done ? "✓" : i + 1}</span><div><b>${x.title}</b><span>${x.text}</span></div></div>`).join("");
+  if (!$("view-wled").hidden) showWled();
 
-  // connection card
-  $("rBridge").textContent = ready ? `Connected on ${b.port}` : b.state === "handshake" ? "Starting…" : b.state === "paused" ? "Paused for flashing" : "Not found";
-  $("rNet").innerHTML = lk.mode === "espnow" ? `ESP-NOW · no network · ch ${esc(b.channel)}`
-    : b.ssid ? `${esc(b.ssid)}${b.hidden ? " · hidden" : ""} · ch ${esc(b.channel)}` : "—";
-  const st = s && s.stations && s.stations[0];
-  $("rSignal").textContent = lk.mode === "espnow" ? (lk.up ? "Linked" : "Not linked")
-    : st ? `${st.rssi} dBm${w && w.signal != null ? ` · ${w.signal}%` : ""}` : "—";
-  const pu = s && s.phoneUrl;
-  $("rPhoneUrl").innerHTML = pu ? `${esc(pu.replace(/^https:\/\//, "").replace(/\/$/, ""))}<button class="copy" data-copy="${esc(pu)}" title="Copy"><svg><use href="#i-copy"/></svg></button>`
-    : "see the README (GitHub Pages)";
-  $("rAddr").innerHTML = s ? `${esc(s.listen)}<button class="copy" data-copy="${esc(s.listen)}" title="Copy"><svg><use href="#i-copy"/></svg></button>` : "—";
-
-  // phone card
-  $("phoneCard").hidden = !(ready && b.phonePin);
-  if (b.phonePin) {
-    $("rPin").innerHTML = `${esc(b.phonePin)}<button class="copy" data-copy="${esc(b.phonePin)}" title="Copy"><svg><use href="#i-copy"/></svg></button>`;
+  // phone
+  const hasPhone = ready && b.phonePin;
+  $("phoneOff").hidden = !!hasPhone;
+  $("phoneOn").hidden = !hasPhone;
+  if (hasPhone) {
+    $("rPin").textContent = b.phonePin;
     $("rPhones").textContent = b.phones ? `${b.phones}` : "None yet";
     if (b.phonePairing > 0) pairUntil = Math.max(pairUntil, Date.now() + b.phonePairing * 1000 - 500);
     else if (pairUntil - Date.now() > 3000) pairUntil = 0;
     updatePairButton();
   }
+  const pu = s && s.phoneUrl;
+  $("phoneUrl").innerHTML = pu ? `${esc(pu.replace(/^https:\/\//, "").replace(/\/$/, ""))}<button class="copy" data-copy="${esc(pu)}" title="Copy"><svg><use href="#i-copy"/></svg></button>`
+    : "Put pc/phone/index.html on GitHub Pages (see the README)";
 
   // settings
+  $("rAddr").innerHTML = s ? `${esc(s.listen)}<button class="copy" data-copy="${esc(s.listen)}" title="Copy"><svg><use href="#i-copy"/></svg></button>` : "—";
   const linkSel = $("linkMode");
   linkSel.disabled = !lk.supported;
   if (document.activeElement !== linkSel && lk.desired) linkSel.value = lk.desired;
-  $("linkHint").textContent = !lk.supported ? "Update the bridge to use ESP-NOW"
+  $("linkHint").textContent = !ready ? "The bridge isn't connected" : !lk.supported ? "Update the bridge to use ESP-NOW"
     : lk.note ? lk.note
     : lk.mode !== lk.desired ? "Switching…"
-    : lk.mode === "espnow" ? (lk.up ? "Linked. Nothing on the air but the link itself" : "Looking for the light")
-    : "The bridge's hidden Wi-Fi network is on the air";
+    : lk.mode === "espnow" ? (lk.up ? "Linked, with no Wi-Fi network on the air" : "Looking for the light")
+    : "Over the bridge's hidden Wi-Fi network";
+  $("rBridge").textContent = ready ? `Connected (${b.port})` : b.state === "handshake" ? "Starting…" : b.state === "paused" ? "Paused for an update" : "Not found";
+  const st = s && s.stations && s.stations[0];
+  $("rLight").textContent = !w ? (ready ? "Not connected" : "—")
+    : lk.mode === "espnow" ? `Linked over ESP-NOW · channel ${b.channel}` : st ? `On the bridge's Wi-Fi · ${st.rssi} dBm` : "Connected";
   const restore = $("restore");
   restore.disabled = !lk.wledBuild;
   if (document.activeElement !== restore && lk.restore != null) restore.checked = !!lk.restore;
@@ -446,20 +573,23 @@ function render() {
   $("rWifi").textContent = b.ssid || "—";
   const f = $("wifiForm");
   if (b.ssid && !f.dataset.filled) { f.ssid.value = b.ssid; f.password.value = b.password || ""; f.channel.value = String(b.channelSetting || 0); f.dataset.filled = 1; }
+  $("rebootBtn").disabled = !ready;
 
-  // diagnostics
+  // diagnostics and about
   const t = (s && s.stats) || {};
   $("dLink").textContent = s && s.baud ? `${(s.baud / 1e6).toFixed(s.baud % 1e6 ? 2 : 0)} Mbaud · ${s.caps && s.caps.includes("ws") ? "instant path" : "compatibility path"}` : "—";
-  $("dFw").textContent = b.firmware ? `Bridge ${b.firmware} · app ${s.version}` : "—";
   $("dUp").textContent = b.uptime != null ? `${Math.floor(b.uptime / 3600)} h ${Math.floor(b.uptime / 60) % 60} min` : "—";
   $("dMem").textContent = b.freeHeap ? `${Math.round(b.freeHeap / 1024)} KB free` + (b.minFreeHeap ? ` · lowest ${Math.round(b.minFreeHeap / 1024)} KB` : "") : "—";
   $("dUdp").textContent = t.udp_forwarded != null ? `${t.udp_forwarded.toLocaleString()} sent` + (t.udpQueueDrops ? ` · ${t.udpQueueDrops} skipped` : "") : "—";
   $("dErr").textContent = `${t.resyncs || 0} resyncs · ${t.serialBadFrames || 0} bad frames`;
   const lf = lk.bridgeFrames || {};
-  $("dRadioRow").style.display = lk.mode === "espnow" ? "" : "none";  // ESP-NOW frames to the light, and their fate
+  $("dRadioRow").style.display = lk.mode === "espnow" ? "" : "none";
   $("dRadio").textContent = lf.sent != null ? `${lf.sent.toLocaleString()} frames · ${(lf.lost || 0).toLocaleString()} unanswered`
     + (lf.stalls ? ` · ${lf.stalls} radio restarts` : "") : "—";
-  $("dWled").textContent = w ? `v${w.version} · ${ws.autoWhiteName ? "white " + ws.autoWhiteName + ", " : ""}${ws.cctBlend != null ? "blend " + ws.cctBlend + "%" : ""}` : "—";
+  $("dBle").textContent = b.ble || "—";
+  $("aApp").textContent = s ? s.version : "—";
+  $("aBridge").textContent = b.firmware || "—";
+  $("aWled").textContent = w ? `${w.version}` + (lk.wledBuild ? " (WLED Link build)" : "") : "—";
 }
 
 function setSlider(p, text) {
@@ -469,7 +599,6 @@ function setSlider(p, text) {
   $("briText").textContent = $("briInk").textContent = text;
   el.setAttribute("aria-valuenow", p);
 }
-
 function updatePairButton() {
   const left = Math.ceil((pairUntil - Date.now()) / 1000);
   const btn = $("pairBtn");
@@ -477,6 +606,19 @@ function updatePairButton() {
   btn.disabled = left > 0;
 }
 setInterval(() => { if (pairUntil) updatePairButton(); }, 1000);
+
+// what the app needs from Windows: start with Windows (loaded when Settings opens)
+async function loadAppInfo() {
+  try {
+    const r = await fetch("/__wledlink/app.json");
+    appInfo = r.ok ? await r.json() : null;
+  } catch (e) { appInfo = null; }
+  const a = (appInfo && appInfo.autostart) || {};
+  const box = $("autostart");
+  box.disabled = !a.installed;
+  box.checked = !!(a.installed && a.enabled);
+  $("autostartHint").textContent = a.installed ? "Runs in the background when you sign in" : "Run install.cmd once to set this up";
+}
 
 // ---------- actions ----------
 let toastTimer;
@@ -495,11 +637,21 @@ async function post(path, body) {
     else if (j.notes && j.notes.length) toast(j.notes.join(" "));
     return j;
   } catch (e) {
-    toast("Lost contact with wledlink", true);
+    toast("Lost contact with WLED Link", true);
     return {};
   }
 }
 const send = (cmd) => post("/__wledlink/api/state", Object.assign({tt: 0}, cmd));
+function openExternal(url) {  // the app window opens web pages in the default browser
+  if (inApp) post("/__wledlink/api/open", {url});
+  else window.open(url, "_blank", "noopener");
+}
+document.addEventListener("click", (e) => {
+  const a = e.target.closest("a[data-external]");
+  if (a) { e.preventDefault(); openExternal(a.href); return; }
+  const b = e.target.closest("[data-copy]");
+  if (b) navigator.clipboard.writeText(b.dataset.copy).then(() => toast("Copied"), () => toast("Couldn't copy", true));
+});
 
 $("power").addEventListener("click", () => {
   const on = modeOf(light()) === "off";  // off -> turn on, anything else -> turn off
@@ -519,7 +671,7 @@ document.querySelectorAll(".tile").forEach((t) => t.addEventListener("click", ()
   const el = $("bri");
   let dragging = false, lastSent = 0, pending = null, timer = null;
   const pctAt = (x) => { const r = el.getBoundingClientRect(); return Math.min(100, Math.max(1, Math.round(((x - r.left) / r.width) * 100))); };
-  const show = (p) => setSlider(p, p + "%");
+  const view = (p) => setSlider(p, p + "%");
   function commit(p, final) {
     optimistic({on: 1, bri: Math.round(p * 2.55)}, 1500);
     pending = p;
@@ -527,8 +679,8 @@ document.querySelectorAll(".tile").forEach((t) => t.addEventListener("click", ()
     if (final || due <= 0) flush(); else if (!timer) timer = setTimeout(flush, due);
   }
   function flush() { clearTimeout(timer); timer = null; if (pending == null) return; lastSent = Date.now(); send({on: true, bri: Math.round(pending * 2.55)}); pending = null; }
-  el.addEventListener("pointerdown", (e) => { dragging = true; el.setPointerCapture(e.pointerId); el.classList.add("dragging"); const p = pctAt(e.clientX); show(p); commit(p); });
-  el.addEventListener("pointermove", (e) => { if (!dragging) return; const p = pctAt(e.clientX); show(p); commit(p); });
+  el.addEventListener("pointerdown", (e) => { dragging = true; el.setPointerCapture(e.pointerId); el.classList.add("dragging"); const p = pctAt(e.clientX); view(p); commit(p); });
+  el.addEventListener("pointermove", (e) => { if (!dragging) return; const p = pctAt(e.clientX); view(p); commit(p); });
   const end = (e) => { if (!dragging) return; dragging = false; el.classList.remove("dragging"); commit(pctAt(e.clientX), true); };
   el.addEventListener("pointerup", end);
   el.addEventListener("pointercancel", end);
@@ -538,7 +690,7 @@ document.querySelectorAll(".tile").forEach((t) => t.addEventListener("click", ()
     if (step === undefined) return;
     e.preventDefault();
     const p = Math.min(100, Math.max(1, cur + step));
-    show(p); commit(p, true);
+    view(p); commit(p, true);
   });
 })();
 
@@ -557,17 +709,16 @@ async function loadPresets(ip) {
   render();
 }
 
-document.addEventListener("click", (e) => {
-  const b = e.target.closest("[data-copy]");
-  if (!b) return;
-  navigator.clipboard.writeText(b.dataset.copy).then(() => toast("Copied"), () => toast("Couldn't copy", true));
-});
 $("pairBtn").addEventListener("click", async () => { pairUntil = Date.now() + 120000; updatePairButton(); await post("/__wledlink/api/phone-pair", {seconds: 120}); });
-$("forgetBtn").addEventListener("click", () => { if (confirm("Forget every paired phone? They'll need to pair again.")) post("/__wledlink/api/phone-forget"); });
+$("forgetBtn").addEventListener("click", () => { if (confirm("Forget every paired phone? They'll need to pair again (and remove \"Lamp\" in the iPhone's Bluetooth settings).")) post("/__wledlink/api/phone-forget"); });
 $("instant").addEventListener("change", (e) => post("/__wledlink/api/wled-transition", {instant: e.target.checked}));
 $("hotspot").addEventListener("change", (e) => { post("/__wledlink/api/wled-hotspot", {mode: e.target.value}); e.target.blur(); });
 $("linkMode").addEventListener("change", (e) => { post("/__wledlink/api/link", {mode: e.target.value}); e.target.blur(); });
 $("restore").addEventListener("change", (e) => post("/__wledlink/api/restore", {on: e.target.checked}));
+$("autostart").addEventListener("change", async (e) => {
+  const j = await post("/__wledlink/api/autostart", {on: e.target.checked});
+  if (j.autostart) { appInfo = Object.assign(appInfo || {}, {autostart: j.autostart}); e.target.checked = !!j.autostart.enabled; }
+});
 $("wifiForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   const f = e.target, b = (status && status.bridge) || {};
@@ -575,20 +726,42 @@ $("wifiForm").addEventListener("submit", async (e) => {
   await post("/__wledlink/api/bridge-config", {ssid: f.ssid.value, password: f.password.value, channel: +f.channel.value,
     hidden: !!b.hidden, txPowerDbm: b.txPowerDbm || 8.5, wifiWithPc: !!b.wifiWithPc});
 });
+$("rebootBtn").addEventListener("click", async () => { await post("/__wledlink/api/bridge-reboot"); toast("The bridge is restarting. The lights are back in a few seconds."); });
+$("logsBtn").addEventListener("click", () => post("/__wledlink/api/open-logs"));
+$("quitBtn").addEventListener("click", async () => {
+  if (!confirm("Quit WLED Link? The lights keep their current look, but SignalRGB, the phone and this app can't reach them until WLED Link runs again (it starts again when you sign in to Windows).")) return;
+  quitting = true;
+  await post("/__wledlink/api/quit");
+  if (window.pywebview) window.pywebview.api.close();
+});
+$("startBtn").addEventListener("click", () => { if (window.pywebview) { window.pywebview.api.start_link(); $("stoppedText").textContent = "Starting…"; } });
 
 // ---------- live updates ----------
+let quitting = false, lostSince = 0;
 function connect() {
   const es = new EventSource("/__wledlink/events");
-  es.onmessage = (e) => { status = JSON.parse(e.data); render(); };
+  es.onmessage = (e) => {
+    status = JSON.parse(e.data);
+    lostSince = 0;
+    $("stopped").hidden = true;
+    render();
+  };
   es.onerror = () => {
     es.close();
-    $("linkPill").className = "pill bad";
-    $("linkText").textContent = "wledlink isn't running";
-    setTimeout(connect, 2000);
+    if (!lostSince) lostSince = Date.now();
+    status = null;
+    render();
+    // a moment of silence is a restart; longer, and WLED Link isn't running
+    if (Date.now() - lostSince > 3000 || quitting) {
+      $("stopped").hidden = false;
+      $("startBtn").hidden = !window.pywebview;
+      $("stoppedText").textContent = window.pywebview ? "It was quit. Start it again to reach the lights." : "Start WLED Link to reach the lights.";
+    }
+    setTimeout(connect, 1500);
   };
 }
+show(location.hash.slice(1) || "home");
 connect();
-render();
 </script>
 </body>
 </html>

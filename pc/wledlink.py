@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import binascii
 import collections
 import contextlib
@@ -40,6 +41,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -50,13 +52,14 @@ try:
 except ImportError:  # reported in main() so --help still works
     serial = None
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 PROTO_VERSION = 1
 
 # Message types, see bridge/src/main.cpp for the payload layouts.
 H_HELLO, H_PING, H_STA_REQ, H_SET_CONFIG, H_REBOOT, H_STATS_REQ = 0x01, 0x02, 0x03, 0x04, 0x05, 0x06
 H_PHONE_PAIR, H_PHONE_FORGET, H_PHONE_PIN, H_WLED_CMD, H_SET_BAUD = 0x07, 0x08, 0x09, 0x0B, 0x0C
 H_SET_LINK, H_LINK_KEY_REQ, B_LINK_KEY = 0x0D, 0x0E, 0x8A
+H_TUNNEL_TEST, B_TUNNEL_TEST = 0x0F, 0x8B  # the phone's tunnel to WLED's web page, tested from the PC
 LINK_MODES = {"espnow": 0, "wifi": 1}  # the bridge's link to the light: ESP-NOW (no Wi-Fi network) or Wi-Fi
 H_TCP_OPEN, H_TCP_DATA, H_TCP_CLOSE, H_UDP_SEND = 0x10, 0x11, 0x12, 0x20
 B_INFO, B_PONG, B_STA_LIST, B_CONFIG_RESULT, B_STATS, B_WLED_STATE, B_BAUD = 0x81, 0x82, 0x83, 0x84, 0x86, 0x88, 0x89
@@ -122,7 +125,9 @@ NVS_START, NVS_END = 0x9000, 0xE000  # the bridge's settings area (bridge/platfo
 FIRMWARE_CONFIG = ROOT / "bridge" / "src" / "config.h"
 CONFIG_FILE = HERE / "wledlink.json"
 APP_DIR = Path(os.environ.get("WLEDLINK_HOME") or Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "wledlink")
-LINK_FILE = APP_DIR / "link.json"  # the radio link's key (the PC keeps a copy) and the chosen mode
+LINK_FILE = APP_DIR / "link.json"
+QUIT_FILE = APP_DIR / "quit"  # "Quit" from the app or the tray: the sign-in it was chosen in
+TASK_NAME = "WLED Link"       # the scheduled task that starts WLED Link with Windows (see install.ps1)  # the radio link's key (the PC keeps a copy) and the chosen mode
 SLOW_USB_FILE = APP_DIR / "slow-usb.json"  # {bridge MAC: when FAST_BAUD failed}, so it isn't retried at every start
 SLOW_USB_RETRY = 30 * 86400
 
@@ -234,6 +239,74 @@ def phone_page_url() -> str | None:
         return None
     m = re.search(r"github\.com[:/]([\w.-]+)/([\w.-]+?)(?:\.git)?/?$", url)
     return f"https://{m.group(1).lower()}.github.io/{m.group(2)}/" if m else None
+
+
+def light_mode(light: dict) -> str:
+    """What the light is doing, as the pages name it: off, sync, effects, preset, warm/neutral/cool, custom, unknown."""
+    if not light or light.get("on") is None or light.get("on", -1) < 0:
+        return "unknown"
+    if not light.get("on"):
+        return "off"
+    if not light.get("lor"):
+        return "sync" if light.get("live") else "effects"
+    if (light.get("ps") or 0) > 0:
+        return "preset"
+    c = (light.get("col") or []) + [0, 0, 0, 0]
+    white = light.get("fx") == 0 and ((c[3] > 0 and not any(c[:3])) or (c[:3] == [255, 255, 255] and not c[3]))
+    if white:
+        cct = light.get("cct") or 0
+        return "warm" if cct <= 63 else "cool" if cct >= 192 else "neutral"
+    return "custom"
+
+
+MODE_NAMES = {"off": "Off", "sync": "PC Sync", "effects": "WLED effect", "preset": "Preset", "warm": "Warm white",
+              "neutral": "Neutral white", "cool": "Cool white", "custom": "Custom colour", "unknown": "Not connected"}
+
+
+def quit_until_sign_in():
+    """Stops WLED Link until Windows is signed in to again or the app is opened: meanwhile the autostart task's
+    watchdog leaves it alone."""
+    with contextlib.suppress(Exception):
+        import desktop
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        QUIT_FILE.write_text(desktop.logon_session())
+    log.info("Quitting until the next sign-in (or until the app is opened)")
+    os._exit(0)
+
+
+def quit_chosen() -> bool:
+    """Whether "Quit" was chosen in this Windows sign-in."""
+    try:
+        import desktop
+        session = desktop.logon_session()
+        return bool(session) and QUIT_FILE.read_text().strip() == session
+    except Exception:
+        return False
+
+
+def _schtasks(*args) -> subprocess.CompletedProcess:
+    return subprocess.run(["schtasks", *args], capture_output=True, text=True, timeout=15,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def autostart_state() -> dict:
+    """{"installed": the task exists, "enabled": it starts WLED Link with Windows}."""
+    try:
+        r = _schtasks("/Query", "/TN", TASK_NAME, "/XML")
+    except (OSError, subprocess.SubprocessError):
+        return {"installed": False, "enabled": False}
+    if r.returncode != 0:
+        return {"installed": False, "enabled": False}
+    settings = re.search(r"<Settings>.*?</Settings>", r.stdout, re.S)
+    enabled = not (settings and re.search(r"<Enabled>\s*false\s*</Enabled>", settings.group(0), re.I))
+    return {"installed": True, "enabled": enabled}
+
+
+def set_autostart(on: bool) -> dict:
+    r = _schtasks("/Change", "/TN", TASK_NAME, "/ENABLE" if on else "/DISABLE")
+    if r.returncode != 0:
+        raise ValueError((r.stderr or r.stdout).strip() or "couldn't change the startup task")
+    return autostart_state()
 
 
 def wifi_fingerprint(ssid: str, password: str) -> str:
@@ -603,6 +676,7 @@ class Config:
     wled_mac: str | None = None
     time_sync: bool = True
     verbose: bool = False
+    tray: bool = True
 
 
 class UdpIn(asyncio.DatagramProtocol):
@@ -654,6 +728,7 @@ class Bridge:
         self._baud_waiter: asyncio.Future | None = None
         self._fast_baud_failed = False
         self._subscribers: set[asyncio.Event] = set()
+        self._tunnel_listeners: set[asyncio.Queue] = set()
         self._polling_light = False
         self._link = load_link()          # {"key": hex, "mode": "espnow"|"wifi"}
         self._key_waiter: asyncio.Future | None = None
@@ -846,6 +921,25 @@ class Bridge:
                 if not fut.done():
                     fut.set_result(result)
             self._config_waiters.clear()
+        elif ftype == B_TUNNEL_TEST:
+            for q in self._tunnel_listeners:
+                q.put_nowait(bytes(payload))
+
+    # -- the phone's tunnel, tested from the PC: the bridge treats these bytes as a phone's (bridge/src/phone.h)
+
+    def tunnel_test_send(self, data: bytes):
+        if self.state != "ready" or "tunnel" not in self.caps:
+            raise LinkDown("the bridge isn't connected, or its firmware has no tunnel")
+        for i in range(0, len(data), 1024):
+            self.send(H_TUNNEL_TEST, data[i:i + 1024])
+
+    def tunnel_test_listen(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue()
+        self._tunnel_listeners.add(q)
+        return q
+
+    def tunnel_test_unlisten(self, q: asyncio.Queue):
+        self._tunnel_listeners.discard(q)
 
     def _on_info(self, payload: bytes):
         try:
@@ -1430,6 +1524,27 @@ class Bridge:
         self.request_resolve()
         return {"ok": True}
 
+    def tray_status(self) -> dict:
+        """What the tray icon shows (read from its thread)."""
+        connected = self.state == "ready" and bool(self.target)
+        mode = light_mode(self.light) if connected else "unknown"
+        if connected:
+            text = MODE_NAMES.get(mode, "Connected")
+        else:
+            text = "Light not connected" if self.state == "ready" else "Bridge not found"
+        return {"connected": connected, "mode": mode, "text": text}
+
+    async def tray_action(self, name: str):
+        try:
+            if name == "sync":
+                self.send_wled(SYNC_STATE)
+            elif name in WHITE_TONES:
+                await self.set_white(name)
+            elif name == "power":
+                self.send_wled({"on": light_mode(self.light) == "off", "tt": 0})
+        except (LinkDown, ValueError, ConnectionError, asyncio.TimeoutError) as exc:
+            log.info("Tray: %s", exc)
+
     def link_status(self) -> dict:
         wll = self._wll() or {}
         return {"desired": self._link.get("mode", "espnow"), "mode": self.info.get("link"),
@@ -1674,6 +1789,24 @@ class HttpFront:
         finally:
             self.bridge.unsubscribe(ev)
 
+    async def _tunnel_events(self, writer):
+        """What the phone's tunnel sends back, while the PC tests it (tunnel_test_send)."""
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\n"
+                     b"Connection: keep-alive\r\n\r\n")
+        q = self.bridge.tunnel_test_listen()
+        try:
+            while True:
+                try:
+                    data = await asyncio.wait_for(q.get(), 15)
+                    while not q.empty() and len(data) < 8192:
+                        data += q.get_nowait()
+                    writer.write(f"data: {base64.b64encode(data).decode()}\n\n".encode())
+                except asyncio.TimeoutError:
+                    writer.write(b": keepalive\n\n")
+                await writer.drain()
+        finally:
+            self.bridge.tunnel_test_unlisten(q)
+
     def _refuse(self, req: Request) -> str | None:
         """Only this PC's own programs and pages may use the link. Listening on loopback keeps other
         machines out, but any website open in a browser here could still send requests to 127.0.0.2
@@ -1773,6 +1906,8 @@ class HttpFront:
             return await writer.drain()
         if path == "/__wledlink/events" and req.method == "GET":
             return await self._events(writer)
+        if path == "/__wledlink/tunnel-test" and req.method == "GET":
+            return await self._tunnel_events(writer)
         if path == "/__wledlink/presets" and req.method == "GET":
             try:
                 return await reply_json(await b.presets())
@@ -1784,12 +1919,17 @@ class HttpFront:
             page = (HERE / "phone" / "index.html").read_bytes()
             writer.write(http_response(200, "OK", page, "text/html; charset=utf-8"))
             return await writer.drain()
+        if path == "/__wledlink/icon.png" and req.method == "GET":
+            writer.write(http_response(200, "OK", (HERE / "app" / "icon.png").read_bytes(), "image/png"))
+            return await writer.drain()
+        if path == "/__wledlink/app.json" and req.method == "GET":  # what the app's settings need from Windows
+            return await reply_json({"version": VERSION, "autostart": await asyncio.to_thread(autostart_state),
+                                     "tray": self.cfg.tray, "logs": str(APP_DIR)})
         if req.method != "POST":
             return await reply_json({"error": "not found"}, 404)
         if path == "/__wledlink/api/quit":
-            log.info("Stopping (asked to by \"wledlink.py stop\")")
             await reply_json({"ok": True})
-            asyncio.get_running_loop().call_later(0.3, os._exit, 0)
+            asyncio.get_running_loop().call_later(0.3, quit_until_sign_in)
             return
         try:
             args = json.loads(body or b"{}")
@@ -1798,6 +1938,9 @@ class HttpFront:
         if not isinstance(args, dict):
             return await reply_json({"error": "expected a JSON object"}, 400)
         try:
+            if path == "/__wledlink/api/tunnel-test":
+                b.tunnel_test_send(base64.b64decode(str(args.get("data", ""))))
+                return await reply_json({"ok": True})
             if path == "/__wledlink/api/bridge-config":
                 return await reply_json(await b.set_bridge_config(args))
             if path == "/__wledlink/api/bridge-reboot":
@@ -1828,6 +1971,17 @@ class HttpFront:
                 return await reply_json(await b.set_restore(bool(args.get("on", True))))
             if path == "/__wledlink/api/wled-hotspot":
                 return await reply_json(await b.set_wled_hotspot(str(args.get("mode", ""))))
+            if path == "/__wledlink/api/autostart":
+                return await reply_json({"ok": True, "autostart": await asyncio.to_thread(set_autostart, bool(args.get("on")))})
+            if path == "/__wledlink/api/open-logs":
+                os.startfile(str(APP_DIR))
+                return await reply_json({"ok": True})
+            if path == "/__wledlink/api/open":  # a web page, in the default browser rather than the app window
+                url = str(args.get("url", ""))
+                if not url.startswith(("https://", "http://")):
+                    raise ValueError("not a web address")
+                webbrowser.open(url)
+                return await reply_json({"ok": True})
         except (LinkDown, ValueError, TypeError, ConnectionError, asyncio.TimeoutError) as exc:
             return await reply_json({"ok": False, "msg": str(exc) or "timed out"}, 409)
         return await reply_json({"error": "not found"}, 404)
@@ -1884,8 +2038,35 @@ async def run_daemon(cfg: Config) -> int:
         return 1
     where = cfg.listen if cfg.http_port == 80 else f"{cfg.listen}:{cfg.http_port}"
     log.info("WLED Link %s: WLED will be at http://%s/ (status page: http://%s/__wledlink)", VERSION, where, where)
+    if cfg.tray:
+        start_tray(bridge)
     await bridge.run()
     return 0
+
+
+def start_tray(bridge: "Bridge"):
+    """The tray icon, if the desktop packages are installed (pystray, Pillow)."""
+    try:
+        import desktop
+    except ImportError:
+        return
+    loop = asyncio.get_running_loop()
+    tray = desktop.Tray(act=lambda name: asyncio.run_coroutine_threadsafe(bridge.tray_action(name), loop),
+                        status=bridge.tray_status,
+                        on_open=lambda: desktop.open_window_process(Path(__file__)),
+                        on_quit=lambda: loop.call_soon_threadsafe(quit_until_sign_in))
+    if not tray.start():
+        return
+
+    async def keep_fresh():
+        changed = bridge.subscribe()
+        while True:
+            tray.refresh()
+            changed.clear()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(changed.wait(), 5)
+
+    asyncio.create_task(keep_fresh())
 
 
 def daemon_url(cfg: Config, path: str) -> str:
@@ -2115,6 +2296,19 @@ def cmd_wled_wifi(cfg: Config, args) -> int:
             ser.close()
 
 
+def cmd_app(cfg: Config) -> int:
+    """The WLED Link window. The link runs on in the background (and in the tray) when it's closed."""
+    try:
+        import desktop
+    except ImportError as exc:
+        print(f"The app needs a few packages: python -m pip install pywebview pystray Pillow ({exc})")
+        return 1
+    script = Path(__file__).resolve()
+    if not daemon_running(cfg):
+        desktop.start_link_process(script)
+    return desktop.run_window(daemon_url(cfg, "/__wledlink?app=1"), APP_DIR / "app", script)
+
+
 def cmd_link(cfg: Config, mode: str | None) -> int:
     if mode:
         rc = cmd_api(cfg, "/__wledlink/api/link", {"mode": mode})
@@ -2251,6 +2445,8 @@ def load_config(args) -> Config:
             setattr(cfg, key, getattr(args, key))
     if getattr(args, "no_time_sync", False):
         cfg.time_sync = False
+    if getattr(args, "no_tray", False):
+        cfg.tray = False
     cfg.verbose = getattr(args, "verbose", False)
     return cfg
 
@@ -2266,7 +2462,12 @@ def main(argv=None) -> int:
     run.add_argument("--baud", type=int, help=f"serial speed (default {DEFAULT_BAUD})")
     run.add_argument("--wled-mac", help="prefer this WLED if several devices join the bridge")
     run.add_argument("--no-time-sync", action="store_true", help="don't send the PC's clock to WLED")
+    run.add_argument("--no-tray", action="store_true", help="no tray icon")
+    run.add_argument("--background", action="store_true",
+                     help="started by Windows (the startup task): stays quiet if Quit was chosen since signing in")
     run.add_argument("-v", "--verbose", action="store_true")
+
+    sub.add_parser("app", help="open the WLED Link window (starts the link too if it isn't running)")
 
     sub.add_parser("status", help="show what the running link is doing")
     sub.add_parser("stop", help="stop the running link (e.g. one running in the background)")
@@ -2322,10 +2523,16 @@ def main(argv=None) -> int:
     cfg = load_config(args)
     command = args.command or "run"
 
+    if command == "app":
+        return cmd_app(cfg)
     if command == "run":
         if daemon_running(cfg):  # e.g. started again by the autostart watchdog: nothing to do
             print(f"WLED Link is already running: {daemon_url(cfg, '/__wledlink')}")
             return 0
+        if args.background and quit_chosen():  # the user quit it: not until the next sign-in or the app opens
+            return 0
+        with contextlib.suppress(OSError):
+            QUIT_FILE.unlink()
         setup_logging(cfg.verbose)
         while True:
             try:
@@ -2339,8 +2546,7 @@ def main(argv=None) -> int:
         return cmd_status(cfg)
     if command == "stop":
         if (rc := cmd_api(cfg, "/__wledlink/api/quit", {})) == 0:
-            print("wledlink stopped. Start it again with: python wledlink.py"
-                  " (with autostart installed, its watchdog does that within a minute)")
+            print("WLED Link stopped until you sign in to Windows again, or open it (python wledlink.py app).")
         return rc
     if command == "ports":
         return cmd_ports()

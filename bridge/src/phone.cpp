@@ -5,12 +5,16 @@
 #include <algorithm>
 
 #include "config.h"
+#include "nimble/nimble/host/services/gatt/include/services/gatt/ble_svc_gatt.h"
 #include "wled.h"
 
 // The phone page (pc/phone/index.html) uses the same UUIDs.
 static const char* SVC_UUID = "8d2a0001-3c55-4b6e-a7f1-6f2b5c0e9a41";
 static const char* CMD_UUID = "8d2a0002-3c55-4b6e-a7f1-6f2b5c0e9a41";    // write: WLED JSON state, e.g. {"on":false}
 static const char* STATE_UUID = "8d2a0003-3c55-4b6e-a7f1-6f2b5c0e9a41";  // read/notify: the light's state (wledStateJson)
+static const char* TUNNEL_UUID = "8d2a0004-3c55-4b6e-a7f1-6f2b5c0e9a41"; // write/notify: WLED's web server (phone.h)
+// Bump when characteristics are added: iPhones keep a paired device's layout, and are told to read it again.
+static const uint32_t GATT_LAYOUT = 2;
 
 static const int MAX_CONN = 3;
 static const int BOOT_BUTTON = 0;
@@ -25,6 +29,7 @@ struct Link {
   uint32_t since = 0;
   bool approved = false;      // paired, and one of our phones
   bool subscribed = false;    // asked for state notifications
+  bool tunnel = false;        // asked for the tunnel's notifications
 };
 
 static Link links[MAX_CONN];
@@ -38,6 +43,27 @@ static volatile uint32_t passkeyAt = 0;  // when a new pairing last asked for th
 static volatile uint8_t lastRefusal = 0; // bits: 1 encrypted, 2 authenticated, 4 new pairing, 8 pairing was open
 static volatile uint32_t fastAdvUntil = 0;
 static portMUX_TYPE listMux = portMUX_INITIALIZER_UNLOCKED;  // links[] is shared with the BLE task
+
+// The tunnel: phone -> bridge bytes as written (the BLE task adds, the main loop takes), and bridge -> phone
+// messages waiting to be notified (main loop only).
+static const size_t TUN_IN = 6144, TUN_OUT = 8192;
+static const size_t TUN_CONTROL = 256;  // kept free for everything but data, so a close always fits
+static const size_t TUN_MSG_MAX = 2048;
+static const int MSYS_RESERVE = 6;      // Bluetooth buffers left for everything else while the tunnel sends
+static const uint8_t TUN_DATA = 0x91;   // B_TCP_DATA
+static NimBLECharacteristic* tunnelChr = nullptr;
+static uint8_t tunIn[TUN_IN];
+static size_t inHead = 0, inLen = 0;
+static volatile uint16_t tunOwner = 0xFFFF;
+static volatile uint32_t tunEpoch = 0;
+static volatile bool tunOverflow = false;
+static portMUX_TYPE tunMux = portMUX_INITIALIZER_UNLOCKED;
+static uint8_t tunOut[TUN_OUT];
+static size_t outHead = 0, outLen = 0, headSent = 0;  // headSent: bytes of the first message already notified
+static uint32_t outEpoch = 0;
+static uint32_t drained[PHONE_SLOTS], queued[PHONE_SLOTS];
+static const uint16_t TEST_OWNER = 0xFFFE;  // the PC, testing the tunnel over USB (phoneTunnelTest)
+static bool (*testOut)(const uint8_t*, size_t) = nullptr;
 
 // The phones allowed in are the ones the bridge holds a pairing (bond) for: it only keeps pairings made while
 // pairing was open, and "Forget phones" deletes them all.
@@ -100,6 +126,169 @@ static void pushState(bool notify) {
       ble_gattc_notify_custom(targets[i], stateChr->getHandle(), ble_hs_mbuf_from_flat(buf, n));
 }
 
+static bool isApproved(ble_gap_conn_desc* desc) {
+  bool ok = false;
+  portENTER_CRITICAL(&listMux);
+  if (Link* l = linkFor(desc->conn_handle, false)) ok = l->approved;
+  portEXIT_CRITICAL(&listMux);
+  return ok && desc->sec_state.authenticated;
+}
+
+// ---------------------------------------------------------------------------------------------
+// the tunnel, bridge -> phone
+
+static uint8_t outAt(size_t i) { return tunOut[(outHead + i) % TUN_OUT]; }
+
+static void syncOut() {  // what was queued for another phone (or one that left) is dropped
+  uint32_t e = tunEpoch;
+  if (e == outEpoch) return;
+  outEpoch = e;
+  phoneTunnelClear();
+}
+
+// n bytes from the front went out: whole messages leave the queue, and data is counted for the credit
+static void sent(size_t n) {
+  while (n) {
+    size_t total = 4 + (outAt(2) | outAt(3) << 8), k = min(n, total - headSent);
+    uint8_t slot = outAt(1);
+    if (outAt(0) == TUN_DATA && slot < PHONE_SLOTS && headSent + k > 4) {
+      size_t data = headSent + k - max(headSent, (size_t)4);
+      drained[slot] += data;
+      queued[slot] -= data;
+    }
+    headSent += k;
+    n -= k;
+    if (headSent == total) {
+      outHead = (outHead + total) % TUN_OUT;
+      outLen -= total;
+      headSent = 0;
+    }
+  }
+}
+
+// As much as the phone's link takes: packets as big as its MTU allows, while Bluetooth has buffers to spare.
+static void pumpTunnel() {
+  syncOut();
+  uint16_t owner = tunOwner;
+  if (owner == 0xFFFF || outLen == headSent || !tunnelChr) return;
+  if (owner == TEST_OWNER) {
+    uint8_t pkt[240];
+    while (outLen > headSent && testOut) {
+      size_t n = min(outLen - headSent, sizeof pkt);
+      for (size_t i = 0; i < n; i++) pkt[i] = outAt(headSent + i);
+      if (!testOut(pkt, n)) break;
+      sent(n);
+    }
+    return;
+  }
+  bool listening = false;
+  portENTER_CRITICAL(&listMux);
+  if (Link* l = linkFor(owner, false)) listening = l->approved && l->tunnel;
+  portEXIT_CRITICAL(&listMux);
+  uint16_t mtu = server->getPeerMTU(owner);
+  if (!listening || mtu < 23) return;
+  size_t most = min((size_t)mtu - 3, (size_t)244);
+  uint8_t pkt[244];
+  while (outLen > headSent && os_msys_num_free() >= MSYS_RESERVE) {
+    size_t n = min(outLen - headSent, most);
+    for (size_t i = 0; i < n; i++) pkt[i] = outAt(headSent + i);
+    os_mbuf* om = ble_hs_mbuf_from_flat(pkt, n);
+    if (!om || ble_gattc_notify_custom(owner, tunnelChr->getHandle(), om) != 0) break;  // (om is freed either way)
+    sent(n);
+  }
+}
+
+size_t phoneTunnelRead(uint8_t* out, size_t cap, uint32_t* epoch) {
+  size_t n = 0;
+  portENTER_CRITICAL(&tunMux);
+  *epoch = tunEpoch;
+  if (inLen >= 4) {
+    size_t len = tunIn[(inHead + 2) % TUN_IN] | tunIn[(inHead + 3) % TUN_IN] << 8;
+    if (len > TUN_MSG_MAX) {
+      tunOverflow = true;  // not a message of ours: start over
+      inLen = 0;
+    } else if (inLen >= 4 + len) {
+      if (len + 2 <= cap) {
+        out[0] = tunIn[inHead];
+        out[1] = tunIn[(inHead + 1) % TUN_IN];
+        for (size_t i = 0; i < len; i++) out[2 + i] = tunIn[(inHead + 4 + i) % TUN_IN];
+        n = len + 2;
+      }
+      inHead = (inHead + 4 + len) % TUN_IN;
+      inLen -= 4 + len;
+    }
+  }
+  portEXIT_CRITICAL(&tunMux);
+  return n;
+}
+
+uint32_t phoneTunnelEpoch() { return tunEpoch; }
+
+static void takeOver(uint16_t owner) {  // call with tunMux held
+  if (tunOwner == owner) return;
+  tunOwner = owner;
+  tunEpoch++;
+  inHead = inLen = 0;
+}
+
+static void addInput(const uint8_t* d, size_t n) {  // call with tunMux held
+  if (inLen + n > TUN_IN) {
+    tunOverflow = true;  // the phone ignored the windows: start it over
+    return;
+  }
+  for (size_t i = 0; i < n; i++) tunIn[(inHead + inLen + i) % TUN_IN] = d[i];
+  inLen += n;
+}
+
+void phoneTunnelTest(const uint8_t* bytes, size_t len, bool (*out)(const uint8_t*, size_t)) {
+  testOut = out;
+  portENTER_CRITICAL(&tunMux);
+  takeOver(TEST_OWNER);
+  addInput(bytes, len);
+  portEXIT_CRITICAL(&tunMux);
+}
+
+void phoneTunnelTestEnd() {
+  portENTER_CRITICAL(&tunMux);
+  if (tunOwner == TEST_OWNER) takeOver(0xFFFF);
+  portEXIT_CRITICAL(&tunMux);
+}
+
+bool phoneTunnelSend(uint8_t type, uint8_t slot, const uint8_t* payload, size_t len) {
+  syncOut();
+  if (tunOwner == 0xFFFF) return true;  // nobody to tell
+  if (outLen + 4 + len > (type == TUN_DATA ? TUN_OUT - TUN_CONTROL : TUN_OUT)) return false;
+  const uint8_t head[4] = {type, slot, (uint8_t)len, (uint8_t)(len >> 8)};
+  for (size_t i = 0; i < 4; i++) tunOut[(outHead + outLen + i) % TUN_OUT] = head[i];
+  for (size_t i = 0; i < len; i++) tunOut[(outHead + outLen + 4 + i) % TUN_OUT] = payload[i];
+  outLen += 4 + len;
+  if (type == TUN_DATA && slot < PHONE_SLOTS) queued[slot] += len;
+  return true;
+}
+
+size_t phoneTunnelRoom() {
+  syncOut();
+  return outLen + 4 + TUN_CONTROL < TUN_OUT ? TUN_OUT - TUN_CONTROL - outLen - 4 : 0;
+}
+
+void phoneTunnelClear() {
+  outHead = outLen = headSent = 0;
+  for (int i = 0; i < PHONE_SLOTS; i++) drained[i] = queued[i] = 0;
+}
+
+uint32_t phoneTunnelDrained(uint8_t slot, bool* idle) {
+  syncOut();
+  if (slot >= PHONE_SLOTS) return 0;
+  *idle = queued[slot] == 0;
+  return drained[slot];
+}
+
+void phoneTunnelCredited(uint8_t slot, uint32_t bytes) {
+  if (slot < PHONE_SLOTS) drained[slot] -= min(bytes, drained[slot]);
+}
+
+// ---------------------------------------------------------------------------------------------
+
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* s, ble_gap_conn_desc* desc) override {
     portENTER_CRITICAL(&listMux);
@@ -108,6 +297,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     NimBLEDevice::startSecurity(desc->conn_handle);  // encrypted at once (iOS asks for the PIN the first time)
     // 15-30 ms connection events (Apple's fastest) from the start, so setting up the page's link is quick too
     server->updateConnParams(desc->conn_handle, 12, 24, 0, 400);
+    server->setDataLen(desc->conn_handle, 251);  // long radio packets: WLED's page loads several times faster
     fastAdvUntil = 0;
     advertise(false);  // stay discoverable for another phone
   }
@@ -116,6 +306,13 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     portENTER_CRITICAL(&listMux);
     if (Link* l = linkFor(desc->conn_handle, false)) *l = Link();
     portEXIT_CRITICAL(&listMux);
+    portENTER_CRITICAL(&tunMux);
+    if (tunOwner == desc->conn_handle) {  // its connections to WLED go too (main.cpp sees the new epoch)
+      tunOwner = 0xFFFF;
+      tunEpoch++;
+      inLen = 0;
+    }
+    portEXIT_CRITICAL(&tunMux);
     fastAdvUntil = millis() + ADV_FAST_MS;  // the phone may be back in a moment
     advertise(true);
   }
@@ -154,13 +351,28 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 
 class CommandCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c, ble_gap_conn_desc* desc) override {
-    bool approved = false;
-    portENTER_CRITICAL(&listMux);
-    if (Link* l = linkFor(desc->conn_handle, false)) approved = l->approved;
-    portEXIT_CRITICAL(&listMux);
-    if (!approved || !desc->sec_state.authenticated) return;
+    if (!isApproved(desc)) return;
     NimBLEAttValue v = c->getValue();
     wledSend((const char*)v.data(), v.length());
+  }
+};
+
+class TunnelCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* c, ble_gap_conn_desc* desc) override {
+    if (!isApproved(desc)) return;
+    NimBLEAttValue v = c->getValue();
+    const uint8_t* d = v.data();
+    size_t n = v.length();
+    portENTER_CRITICAL(&tunMux);
+    takeOver(desc->conn_handle);  // another phone takes the tunnel over, from scratch
+    addInput(d, n);
+    portEXIT_CRITICAL(&tunMux);
+  }
+
+  void onSubscribe(NimBLECharacteristic* c, ble_gap_conn_desc* desc, uint16_t subValue) override {
+    portENTER_CRITICAL(&listMux);
+    if (Link* l = linkFor(desc->conn_handle, false)) l->tunnel = subValue & 1;
+    portEXIT_CRITICAL(&listMux);
   }
 };
 
@@ -196,6 +408,10 @@ void phoneBegin() {
   stateChr = svc->createCharacteristic(
       STATE_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::READ_AUTHEN | NIMBLE_PROPERTY::NOTIFY, 200);
   stateChr->setCallbacks(new StateCallbacks());
+  tunnelChr = svc->createCharacteristic(
+      TUNNEL_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::WRITE_ENC | NIMBLE_PROPERTY::WRITE_AUTHEN |
+      NIMBLE_PROPERTY::NOTIFY, 512);
+  tunnelChr->setCallbacks(new TunnelCallbacks());
   pushState(false);
   svc->start();
 
@@ -203,7 +419,16 @@ void phoneBegin() {
   adv->addServiceUUID(SVC_UUID);
   adv->setScanResponse(true);  // the name, for the phone's device list
   fastAdvUntil = millis() + ADV_FAST_MS;
-  advertise(true);
+  advertise(true);  // (this also starts the GATT server)
+
+  Preferences p;  // characteristics were added: paired phones are told to read the layout again when they're back
+  if (p.begin("wlble", false)) {
+    if (p.getUInt("gatt", 0) != GATT_LAYOUT) {
+      ble_svc_gatt_changed(0x0001, 0xFFFF);
+      p.putUInt("gatt", GATT_LAYOUT);
+    }
+    p.end();
+  }
 }
 
 void phoneLoop() {
@@ -227,6 +452,13 @@ void phoneLoop() {
     if (l.handle != 0xFFFF && !l.approved && millis() - l.since > UNPAIRED_KICK_MS && kick == 0xFFFF) kick = l.handle;
   portEXIT_CRITICAL(&listMux);
   if (kick != 0xFFFF) server->disconnect(kick);
+  if (tunOverflow) {  // the tunnel's stream is out of step: the phone reconnects and starts it over
+    tunOverflow = false;
+    uint16_t owner = tunOwner;
+    if (owner == TEST_OWNER) phoneTunnelTestEnd();
+    else if (owner != 0xFFFF) server->disconnect(owner);
+  }
+  pumpTunnel();
 
   // Our own link table and NimBLE's connection list must agree, and a phone must always be able to find the
   // bridge while there is room for another connection. Checked every 2 s, so nothing can stay stuck.

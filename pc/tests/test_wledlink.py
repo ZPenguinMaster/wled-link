@@ -138,7 +138,7 @@ async def e2e():
     out = open(log_path, "w")
     daemon = subprocess.Popen(
         [sys.executable, os.path.join(HERE, "..", "wledlink.py"), "--listen", LISTEN, "--http-port", str(HTTP_PORT),
-         "run", "--port", f"socket://127.0.0.1:{bridge.port}", "-v"],
+         "run", "--port", f"socket://127.0.0.1:{bridge.port}", "-v", "--no-tray"],
         stdout=out, stderr=subprocess.STDOUT, env=env)
     try:
         print("startup")
